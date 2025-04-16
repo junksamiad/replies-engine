@@ -7,65 +7,177 @@ This document outlines the high-level design for handling incoming user replies,
 1.  **Webhook Reception:**
     *   Twilio receives a reply message from the end-user via WhatsApp.
     *   Twilio sends an HTTP POST request (webhook) containing the message details (sender number, message body, etc.) to a predefined endpoint in the AWS infrastructure.
-    *   This endpoint is handled by **API Gateway**.
+    *   API Gateway receives this webhook and validates it through:
+        * Resource policies requiring specific headers
+        * Request validators ensuring correct format
+        * Throttling and quota limits protecting against abuse
 
-2.  **Initial Processing & DB Lookup (New Lambda: `IncomingWebhookHandler`):**
-    *   API Gateway triggers a new Lambda function (e.g., `IncomingWebhookHandler`).
+2.  **Initial Processing & DB Lookup (Lambda: `IncomingWebhookHandler`):**
+    *   API Gateway triggers the `IncomingWebhookHandler` Lambda function.
     *   This Lambda parses the incoming Twilio payload to extract essential information (sender's phone number `recipient_tel`, message content).
     *   It queries the `ConversationsTable` (DynamoDB) using `recipient_tel` (or a suitable secondary index) to find the existing conversation record.
-    *   *Error Handling:* If no matching record is found, log an error or handle as per design (e.g., discard, start new conversation).
-    *   If a record is found, retrieve the existing OpenAI `thread_id` and the `handoff_to_human` flag.
+    *   **Conversation Record Update:**
+        *   If a matching record is found, the Lambda immediately updates the record with:
+            *   The incoming user message content
+            *   Updated timestamp
+            *   Change conversation status to `user_reply_received`
+            *   Any other relevant metadata from the message
+        *   This update ensures the message is recorded even if later processing fails.
+    *   **Context Object Creation:**
+        *   The Lambda creates a comprehensive context object containing:
+            *   Message metadata (sender, receiver, content, timestamps)
+            *   Conversation details (ID, status, thread_id)
+            *   Company and project information
+            *   Credential references for downstream processing
+            *   Processing metadata (request_id, channel type)
+    *   **Error Handling:** If no matching record is found, the Lambda sends a templated fallback message (rate-limited) informing the user that the conversation is no longer active.
 
 3.  **Routing Logic:**
-    *   The `IncomingWebhookHandler` checks the `handoff_to_human` flag.
+    *   The `IncomingWebhookHandler` checks the `handoff_to_human` flag in the conversation record.
     *   **If `handoff_to_human` is `true`:**
-        *   Construct a message payload (incoming message details, `conversation_id`, `thread_id`).
-        *   Send payload to a dedicated **SQS queue for human intervention** (e.g., `ai-multi-comms-human-handoff-queue-dev`).
-        *   Automated processing stops here for this message.
+        *   Send the context object to the **SQS queue for human intervention** (e.g., `ai-multi-comms-handoff-queue-dev`).
+        *   Automated AI processing stops here for this message.
     *   **If `handoff_to_human` is `false`:**
-        *   Construct a similar message payload.
-        *   Send payload to the **SQS queue for AI-handled WhatsApp replies** (e.g., `ai-multi-comms-whatsapp-replies-queue-dev`).
+        *   Send the context object to the **SQS queue for AI-handled replies** (e.g., `ai-multi-comms-whatsapp-replies-queue-dev`).
+    *   The Lambda returns a successful response to Twilio immediately after queueing, not waiting for processing to complete.
 
 4.  **Message Delay/Batching (SQS Feature):**
-    *   Messages sent to `ai-multi-comms-whatsapp-replies-queue-dev` utilize SQS's `DelaySeconds` feature (e.g., 30 seconds).
+    *   Messages sent to `ai-multi-comms-whatsapp-replies-queue-dev` utilize SQS's `DelaySeconds` feature (30 seconds).
     *   This delay allows subsequent messages in a user's burst to arrive before processing begins.
-    *   *Note:* The specific logic for grouping/batching messages arriving within this window needs further definition.
+    *   Standard queue configuration includes:
+        *   Visibility timeout: 2 minutes
+        *   Message retention: 14 days
+        *   Dead-letter queue for failed processing attempts
 
-5.  **AI Processing (New Lambda: `ReplyProcessorLambda`):**
-    *   After the SQS delay, a separate Lambda function (e.g., `ReplyProcessorLambda`), triggered by `ai-multi-comms-whatsapp-replies-queue-dev`, receives the message(s).
-    *   Perform validation on the message context.
-    *   Interact with **OpenAI Assistants API**:
-        *   Add user message(s) to the existing OpenAI `thread_id`.
-        *   Run the appropriate OpenAI Assistant (e.g., `assistant_id_replies`) on the thread.
-        *   Retrieve the AI-generated response.
-    *   *Error Handling:* Implement checks for failures during OpenAI interaction.
+5.  **AI Processing (Lambda: `ReplyProcessorLambda`):**
+    *   After the SQS delay, the `ReplyProcessorLambda` function, triggered by the replies queue, receives the context object.
+    *   This Lambda retrieves the necessary credentials from AWS Secrets Manager using the references in the context.
+    *   It then interacts with the **OpenAI Assistants API**:
+        *   Add user message(s) to the existing OpenAI `thread_id` found in the context.
+        *   Run the appropriate OpenAI Assistant on the thread.
+        *   Monitor the run for completion or function calls.
+        *   Retrieve the AI-generated response once complete.
+    *   The Lambda enriches the context object with the AI response and processing metadata.
+    *   **Error Handling:** If the OpenAI interaction fails, the Lambda records the error, updates the conversation status, and optionally routes to human intervention.
 
-6.  **Sending Reply via Twilio:**
-    *   The `ReplyProcessorLambda` takes the AI-generated response.
-    *   Call the **Twilio API** to send the response back to the original sender's WhatsApp number.
-    *   *Error Handling:* Implement checks for failures during Twilio sending.
+6.  **Sending Reply via Twilio (Lambda: `TwilioSenderLambda`):**
+    *   The `ReplyProcessorLambda` sends the enriched context to another SQS queue for sending.
+    *   The `TwilioSenderLambda` retrieves the context and handles the external communication:
+        *   Retrieves Twilio credentials from AWS Secrets Manager using the reference in the context.
+        *   Formats the AI-generated response for the channel (WhatsApp).
+        *   Calls the **Twilio API** to send the message to the original sender's number.
+        *   Records the sending results in the context.
+    *   **Error Handling:** Implements retries for transient failures and records permanent failures.
 
 7.  **Final Conversation Update:**
-    *   After sending the reply (or noting a failure), the `ReplyProcessorLambda` updates the corresponding record in the `ConversationsTable` (DynamoDB).
-    *   Include user message(s), AI reply, timestamps, and update status.
+    *   The `TwilioSenderLambda` performs the final update to the conversation record in DynamoDB:
+        *   Records the AI response content
+        *   Updates the conversation status to `ai_response_sent`
+        *   Stores message IDs and delivery metadata
+        *   Updates relevant timestamps
 
 ## 2. Key Components Involved
 
-*   **API Gateway:** New endpoint to receive Twilio webhooks.
-*   **Lambda (`IncomingWebhookHandler`):** Parses webhook, queries DB, routes to SQS.
-*   **DynamoDB (`ConversationsTable`):** Queried for existing conversation, `thread_id`, and `handoff_to_human` flag. Updated at the end.
-*   **SQS (`ai-multi-comms-human-handoff-queue-dev`):** Queue for messages needing human review.
-*   **SQS (`ai-multi-comms-whatsapp-replies-queue-dev`):** Queue for messages to be handled by AI, configured with `DelaySeconds`.
-*   **Lambda (`ReplyProcessorLambda`):** Triggered by replies queue, interacts with OpenAI and Twilio, updates DB.
-*   **OpenAI Assistants API:** Used to continue existing conversation threads.
-*   **Twilio API:** Used to send the AI-generated reply back to the user.
-*   **AWS Secrets Manager:** (Implicitly used by `ReplyProcessorLambda` to fetch OpenAI/Twilio credentials, similar to the outgoing processor).
+*   **API Gateway:** 
+    *   Secure endpoint to receive Twilio webhooks
+    *   Resource policies and request validation for security
+    *   Throttling and quota protection against abuse
 
-## 3. Assumptions & Considerations
+*   **Lambda Functions:**
+    *   `IncomingWebhookHandler`: Processes webhooks, updates conversation with user message, routes to appropriate queue
+    *   `ReplyProcessorLambda`: Handles AI interaction and response generation
+    *   `TwilioSenderLambda`: Manages external communication and final record updates
 
-*   Focus is solely on WhatsApp via Twilio for this initial replies HLD.
-*   A unique identifier (like `recipient_tel`) can reliably link incoming messages to existing conversation records in DynamoDB. An appropriate index might be needed on `ConversationsTable`.
-*   The logic for handling multiple messages arriving during the SQS delay window (step 4) needs detailed design (e.g., combine messages before sending to AI, process sequentially).
-*   Error handling paths (DB lookup failure, OpenAI failure, Twilio failure, DB update failure) need robust implementation.
-*   Security for the webhook endpoint (e.g., validating Twilio signatures) is crucial.
-*   Existing CI/CD and SAM templates will need updates to incorporate these new resources. 
+*   **DynamoDB (`ConversationsTable`):** 
+    *   Primary store for conversation records
+    *   Indexed on primary_channel (phone number/email) for efficient lookups
+    *   Stores conversation state, messages, and metadata
+
+*   **SQS Queues:**
+    *   `ai-multi-comms-whatsapp-replies-queue-dev`: For messages to be handled by AI, with 30-second delay
+    *   `ai-multi-comms-handoff-queue-dev`: For messages requiring human review
+    *   `ai-multi-comms-sender-queue-dev`: For messages ready to be sent externally
+
+*   **External Services:**
+    *   **OpenAI Assistants API**: Used to continue existing conversation threads
+    *   **Twilio API**: Used to send the AI-generated reply back to the user
+
+*   **AWS Secrets Manager:** 
+    *   Securely stores credentials for external services
+    *   Referenced by credential identifiers in the context object
+
+## 3. Structured Context Object
+
+A standardized context object flows through the system, enriched at each step:
+
+```json
+{
+  "meta": {
+    "request_id": "uuid-here",
+    "channel_type": "whatsapp",
+    "timestamp": "2023-06-01T12:34:56.789Z",
+    "version": "1.0"
+  },
+  "conversation": {
+    "conversation_id": "conversation-uuid",
+    "primary_channel": "+1234567890",
+    "conversation_status": "user_reply_received",
+    "hand_off_to_human": false,
+    "thread_id": "thread_abc123xyz"
+  },
+  "message": {
+    "from": "+1234567890",
+    "to": "+0987654321",
+    "body": "Hello there",
+    "message_id": "twilio-message-id",
+    "timestamp": "2023-06-01T12:34:50.123Z"
+  },
+  "company": {
+    "company_id": "company-123",
+    "project_id": "project-456",
+    "company_name": "Cucumber Recruitment",
+    "credentials_reference": "whatsapp-credentials/cucumber-recruitment/cv-analysis/twilio"
+  },
+  "processing": {
+    "validation_status": "valid",
+    "ai_response": null,
+    "sent_response": null,
+    "processing_timestamps": {
+      "received": "2023-06-01T12:34:56.789Z",
+      "validated": "2023-06-01T12:34:57.123Z",
+      "queued": "2023-06-01T12:34:57.456Z"
+    }
+  }
+}
+```
+
+## 4. Assumptions & Considerations
+
+*   Focus is initially on WhatsApp via Twilio, with the architecture designed to support future channels (SMS, email).
+*   Message timestamps are preserved throughout the pipeline for accurate conversation ordering.
+*   Concurrency and race conditions are addressed through:
+    *   DynamoDB conditional updates
+    *   Optimistic locking for record modifications
+    *   SQS FIFO queues when strict ordering is required
+*   Error handling paths include:
+    *   DB lookup failures
+    *   OpenAI API failures
+    *   Twilio API failures
+    *   Rate limiting for unknown senders
+*   Security for webhook endpoints includes:
+    *   API Gateway resource policies
+    *   Request validation
+    *   Throttling and quotas
+*   Timeouts and retries are configured appropriately for each Lambda and external service interaction.
+*   The architecture minimizes processing costs by:
+    *   Validating requests early in the pipeline
+    *   Using AWS Secrets Manager references instead of embedding credentials
+    *   Leveraging serverless components that scale with demand
+
+## 5. Future Enhancements
+
+*   Support for SMS and email channels
+*   Real-time status updates for conversations
+*   Enhanced monitoring and alerting
+*   Analytics and reporting capabilities
+*   Integration with CRM systems 

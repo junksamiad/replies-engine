@@ -121,45 +121,86 @@ Usage plans will be implemented to protect against denial-of-service attacks and
 
 ### 4.1 Conversation Record Processing
 
-The Lambda function will process the webhook based on the conversation's existence and status.
+The `IncomingWebhookHandler` Lambda function performs initial processing for all incoming webhooks regardless of channel type, following a standardized flow:
 
-**Overall Processing Flow:**
-1. Lambda extracts the sender's contact information from the webhook payload
-2. Query DynamoDB to find the conversation record associated with the sender
-3. Create a comprehensive context object to track the message through the system
-4. Process according to conversation status and channel type
+**Conversation Lookup and Update Flow:**
+1. Extract sender's contact information from the webhook payload based on channel type:
+   - WhatsApp/SMS: `From` parameter from Twilio payload
+   - Email: Sender address from email headers
+2. Query DynamoDB to find the corresponding conversation record using the sender identifier
+3. If record exists:
+   - Update the conversation record with the incoming message:
+     ```python
+     # Simplified pseudo-code
+     update_expression = "SET messages = list_append(messages, :new_message), 
+                          conversation_status = :status,
+                          last_user_message_at = :timestamp,
+                          last_activity_at = :timestamp"
+     
+     expression_values = {
+         ":new_message": [{
+             "message_id": webhook_data.message_id,
+             "direction": "INBOUND",
+             "content": webhook_data.body,
+             "timestamp": current_timestamp,
+             "channel_type": channel_type,
+             "metadata": {...}  # Channel-specific metadata
+         }],
+         ":status": "user_reply_received",
+         ":timestamp": current_timestamp
+     }
+     ```
+   - This update is performed as an atomic operation to ensure the message is recorded even if subsequent processing fails
+4. If record does not exist:
+   - Log the unknown sender attempt
+   - Implement rate-limited fallback messaging (max 1 response per sender per 24h)
+   - Return early without further processing
 
-**For Existing Conversations:**
-1. Retrieve the conversation details and credentials reference
-2. Update the conversation record with the new message
-3. Determine if the message should be handled by AI or human agent
-4. Route to the appropriate SQS queue (replies or handoff)
+**Context Object Creation:**
+1. After the record update, retrieve the complete conversation record with all associated data
+2. Construct a comprehensive context object containing:
+   - Message details from the webhook
+   - Conversation data (ID, status, thread_id, etc.)
+   - Company and project information from the record
+   - Channel-specific configuration (credentials reference, templates, etc.)
+   - Processing metadata (timestamps, validation status, request IDs)
 
-**For Unknown Numbers/Emails (Fallback Handling):**
-1. Implement rate limiting (max 1 response per number per 24 hours)
-2. Send a templated response informing the sender that the conversation is no longer active
-3. Provide alternative contact methods (website, phone)
-4. Log the occurrence for monitoring
+**Channel and Queue Routing:**
+1. Determine the appropriate processing path based on multiple factors:
+   - Check `handoff_to_human` flag in the conversation record
+   - Examine `channel_method` to identify channel-specific processing needs (whatsapp, sms, email)
+   - Verify conversation status is valid for further processing
+2. Based on these factors, route to the appropriate SQS queue:
+   ```python
+   if handoff_to_human:
+       # Route to human agent queue
+       sqs.send_message(
+           QueueUrl=f"ai-multi-comms-{channel_method}-handoff-queue-{stage}",
+           MessageBody=json.dumps(context_object)
+       )
+   else:
+       # Route to AI processing queue
+       sqs.send_message(
+           QueueUrl=f"ai-multi-comms-{channel_method}-replies-queue-{stage}",
+           MessageBody=json.dumps(context_object),
+           DelaySeconds=30  # Allow message batching
+       )
+   ```
 
-**Fallback Implementation:**
-```python
-def handle_unknown_sender(channel_type, sender_id):
-    # Check if we've already sent a fallback to this sender recently
-    if has_received_fallback_recently(sender_id):
-        log.info(f"Ignoring repeat unknown sender: {sender_id}")
-        return
-        
-    # Send appropriate channel-specific fallback
-    if channel_type == "whatsapp":
-        send_whatsapp_fallback_template(sender_id)
-    elif channel_type == "sms":
-        send_sms_fallback(sender_id)
-    elif channel_type == "email":
-        send_email_fallback(sender_id)
-        
-    # Record fallback timestamp with TTL
-    record_fallback_sent(sender_id)
-```
+**Single Lambda for Initial Processing:**
+- The `IncomingWebhookHandler` serves as a unified entry point for all channels
+- Channel-specific logic is isolated within well-defined sections of code
+- Configuration is externalized in environment variables and DynamoDB records
+- A factory pattern is used to select the appropriate message parser based on channel type
+- This approach reduces duplication while maintaining channel-specific handling when needed
+
+**Post-Queue Processing:**
+- After the SQS queue, channel-specific Lambdas handle the actual processing:
+  - `WhatsappReplyProcessorLambda`
+  - `SmsReplyProcessorLambda`
+  - `EmailReplyProcessorLambda`
+- This architecture mirrors the template-sender-engine design pattern
+- Each processor Lambda is optimized for channel-specific requirements while sharing common core logic through shared libraries
 
 ### 4.2 Message Routing and Context Object
 
