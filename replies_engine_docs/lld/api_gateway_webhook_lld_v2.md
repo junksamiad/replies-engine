@@ -119,34 +119,21 @@ Usage plans will be implemented to protect against denial-of-service attacks and
 
 ## 4. Webhook Processing Flow
 
-### 4.1 Signature Validation
+### 4.1 Conversation Record Processing
 
-All webhook requests must be validated to ensure they originated from the expected service provider.
+The Lambda function will process the webhook based on the conversation's existence and status.
 
-**Twilio Signature Validation Process:**
-1. Lambda function extracts `X-Twilio-Signature` header from the request
-2. Extract sender's phone number (`From` parameter) from the body
-3. Query DynamoDB to find the conversation record associated with this number
-4. If found, retrieve the credential reference (`channel_config.whatsapp.whatsapp_credentials_id`)
-5. Call AWS Secrets Manager to get the Twilio auth token using this reference
-6. Reconstruct the expected signature using:
-   - The Twilio auth token
-   - The full webhook URL
-   - All POST parameters in alphabetical order
-7. Compare calculated signature with the received `X-Twilio-Signature`
-8. Proceed only if signatures match
-
-**Email Validation:** (TBD based on email provider)
-- Similar process using appropriate signature validation for the email provider
-
-### 4.2 Conversation Record Processing
-
-After signature validation, the Lambda will process the message based on conversation status.
+**Overall Processing Flow:**
+1. Lambda extracts the sender's contact information from the webhook payload
+2. Query DynamoDB to find the conversation record associated with the sender
+3. Create a comprehensive context object to track the message through the system
+4. Process according to conversation status and channel type
 
 **For Existing Conversations:**
-1. Update the conversation record with the new message
-2. Process the message according to business logic
-3. Trigger appropriate response workflows
+1. Retrieve the conversation details and credentials reference
+2. Update the conversation record with the new message
+3. Determine if the message should be handled by AI or human agent
+4. Route to the appropriate SQS queue (replies or handoff)
 
 **For Unknown Numbers/Emails (Fallback Handling):**
 1. Implement rate limiting (max 1 response per number per 24 hours)
@@ -174,6 +161,52 @@ def handle_unknown_sender(channel_type, sender_id):
     record_fallback_sent(sender_id)
 ```
 
+### 4.2 Message Routing and Context Object
+
+A standardized context object will be created to track the message through the processing pipeline:
+
+```json
+{
+  "meta": {
+    "request_id": "uuid-here",
+    "channel_type": "whatsapp",
+    "timestamp": "2023-06-01T12:34:56.789Z",
+    "version": "1.0"
+  },
+  "conversation": {
+    "conversation_id": "conversation-uuid",
+    "primary_channel": "+1234567890",
+    "conversation_status": "active",
+    "hand_off_to_human": false
+  },
+  "message": {
+    "from": "+1234567890",
+    "to": "+0987654321",
+    "body": "Hello there",
+    "message_id": "twilio-message-id",
+    "timestamp": "2023-06-01T12:34:50.123Z"
+  },
+  "company": {
+    "company_id": "company-123",
+    "project_id": "project-456",
+    "company_name": "Cucumber Recruitment",
+    "credentials_reference": "whatsapp-credentials/cucumber-recruitment/cv-analysis/twilio"
+  },
+  "processing": {
+    "validation_status": "valid",
+    "ai_response": null,
+    "sent_response": null,
+    "processing_timestamps": {
+      "received": "2023-06-01T12:34:56.789Z",
+      "validated": "2023-06-01T12:34:57.123Z",
+      "queued": "2023-06-01T12:34:57.456Z"
+    }
+  }
+}
+```
+
+This context object will be placed on the appropriate SQS queue for further processing.
+
 ## 5. Integration with Backend Systems
 
 ### 5.1 Lambda Integration
@@ -196,6 +229,17 @@ def handle_unknown_sender(channel_type, sender_id):
 - **Access Method**: Lambda retrieves credentials based on stored reference
 - **Credential Reference Format**: `{channel}-credentials/{company_name}/{project_name}/{provider}`
 - **Example**: `whatsapp-credentials/cucumber-recruitment/cv-analysis/twilio`
+
+### 5.4 SQS Integration
+
+- **Queues**:
+  - `WhatsAppRepliesQueue`: For messages to be processed by AI
+  - `HandoffQueue`: For messages requiring human intervention
+- **Configuration**:
+  - Standard queues with message delay (30 seconds)
+  - Visibility timeout: 2 minutes
+  - Dead-letter queue for failed processing
+  - Retention period: 14 days
 
 ## 6. Response Handling
 
@@ -291,7 +335,7 @@ Resources:
 
 ### Unit Testing
 
-- Test signature validation logic in isolation
+- Test message parsing logic in isolation
 - Test DynamoDB interaction patterns
 - Mock Secrets Manager for credential retrieval testing
 
