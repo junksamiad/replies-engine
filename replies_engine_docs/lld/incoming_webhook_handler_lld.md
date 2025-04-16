@@ -2,21 +2,167 @@
 
 ## 1. Purpose and Responsibilities
 
-The IncomingWebhookHandler Lambda function serves as the first processing layer for incoming webhook requests from Twilio. Its primary responsibilities include:
+The IncomingWebhookHandler Lambda function serves as the unified entry point for all incoming webhook requests across different communication channels. Its primary responsibilities include:
 
-- Validating that incoming webhooks are genuine Twilio requests using signature verification
-- Parsing the webhook payload to extract essential information (sender number, message content)
-- Looking up existing conversation records in DynamoDB using the sender's WhatsApp number
-- Checking the conversation state to determine routing (AI processing vs. human handoff)
-- Constructing appropriate messages and sending them to the correct SQS queue
-- Returning appropriate responses to API Gateway for Twilio
+- Receiving and processing webhooks from multiple channels (WhatsApp/SMS via Twilio, email via SendGrid)
+- Parsing channel-specific payloads using a factory pattern approach
+- Looking up existing conversation records in DynamoDB using the sender's identifier
+- Updating conversation records with incoming message content and metadata
+- Creating a standardized context object for consistent processing
+- Routing messages to the appropriate SQS queue based on conversation state and channel type
+- Returning appropriate responses based on the originating channel
 
-## 2. Handler Function Structure
+## 2. Multi-Channel Processing Architecture
+
+### 2.1 Channel Identification and Routing
+
+The Lambda function determines the channel type from the API Gateway event path:
+
+```python
+def determine_channel_type(event):
+    """
+    Determine the channel type based on the API Gateway path.
+    
+    Args:
+        event (dict): API Gateway event
+        
+    Returns:
+        str: Channel type (whatsapp, sms, email)
+    """
+    path = event.get('path', '').lower()
+    
+    if '/whatsapp' in path:
+        return 'whatsapp'
+    elif '/sms' in path:
+        return 'sms'
+    elif '/email' in path:
+        return 'email'
+    else:
+        raise UnsupportedChannelError(f"Unsupported channel path: {path}")
+```
+
+### 2.2 Parser Factory Pattern
+
+The Lambda implements a parser factory pattern to handle channel-specific webhook formats:
+
+```python
+class WebhookParserFactory:
+    @staticmethod
+    def get_parser(channel_type, event, logger):
+        """
+        Return the appropriate parser for the given channel type.
+        
+        Args:
+            channel_type (str): The communication channel type
+            event (dict): The API Gateway event
+            logger: Logger instance
+            
+        Returns:
+            WebhookParser: A parser instance for the specified channel
+            
+        Raises:
+            UnsupportedChannelError: If the channel type is not supported
+        """
+        if channel_type == 'whatsapp' or channel_type == 'sms':
+            return TwilioWebhookParser(event, logger)
+        elif channel_type == 'email':
+            return SendgridWebhookParser(event, logger)
+        else:
+            raise UnsupportedChannelError(f"Unsupported channel type: {channel_type}")
+```
+
+### 2.3 Channel-Specific Parsers
+
+Each parser implements a common interface but handles channel-specific details:
+
+```python
+class WebhookParser:
+    """Abstract base class for webhook parsers."""
+    
+    def __init__(self, event, logger):
+        self.event = event
+        self.logger = logger
+    
+    def parse(self):
+        """
+        Parse the webhook payload.
+        
+        Returns:
+            dict: Standardized webhook data
+        """
+        raise NotImplementedError("Subclasses must implement parse()")
+    
+    def validate(self):
+        """
+        Validate the webhook authenticity.
+        
+        Returns:
+            bool: True if valid, False otherwise
+        """
+        raise NotImplementedError("Subclasses must implement validate()")
+
+class TwilioWebhookParser(WebhookParser):
+    """Parser for Twilio webhooks (WhatsApp and SMS)."""
+    
+    def parse(self):
+        """Parse the Twilio webhook payload."""
+        body = self.event.get('body', '')
+        # Parse application/x-www-form-urlencoded format
+        parsed_body = parse_qs(body)
+        
+        # Determine if this is WhatsApp or SMS based on the From field
+        from_field = parsed_body.get('From', [''])[0]
+        is_whatsapp = from_field.startswith('whatsapp:')
+        
+        # Extract the sender ID (phone number)
+        sender_id = from_field.split('whatsapp:')[1] if is_whatsapp else from_field
+        
+        return {
+            'channel_type': 'whatsapp' if is_whatsapp else 'sms',
+            'sender_id': sender_id,
+            'recipient_id': parsed_body.get('To', [''])[0],
+            'message_content': parsed_body.get('Body', [''])[0],
+            'message_id': parsed_body.get('MessageSid', [''])[0],
+            'timestamp': datetime.utcnow().isoformat(),
+            'raw_payload': parsed_body
+        }
+    
+    def validate(self):
+        """Validate the Twilio signature."""
+        # Extract Twilio signature from headers
+        twilio_signature = self.event.get('headers', {}).get('X-Twilio-Signature')
+        if not twilio_signature:
+            self.logger.warning("Missing X-Twilio-Signature header")
+            return False
+        
+        # Implementation of Twilio signature validation
+        # (Detailed implementation omitted for brevity)
+        return True
+
+class SendgridWebhookParser(WebhookParser):
+    """Parser for SendGrid email webhooks."""
+    
+    def parse(self):
+        """Parse the SendGrid webhook payload."""
+        # Implementation for email parsing
+        # (Detailed implementation omitted for brevity)
+        pass
+    
+    def validate(self):
+        """Validate the SendGrid webhook signature."""
+        # Implementation for email validation
+        # (Detailed implementation omitted for brevity)
+        pass
+```
+
+## 3. Conversation Processing Flow
+
+### 3.1 Updated Handler Function
 
 ```python
 def lambda_handler(event, context):
     """
-    Main handler for incoming webhooks from Twilio.
+    Main handler for incoming webhooks from all channels.
     
     Args:
         event (dict): API Gateway event containing webhook data
@@ -25,566 +171,399 @@ def lambda_handler(event, context):
     Returns:
         dict: Response object for API Gateway
     """
+    # Initialize logger with request ID
+    logger = setup_logger(context)
+    logger.info("Received webhook request", extra={"event_path": event.get('path')})
+    
     try:
-        # Initialize logger
-        logger = setup_logger(context)
-        logger.info("Received webhook request")
+        # Determine channel type from API Gateway path
+        channel_type = determine_channel_type(event)
+        logger.info(f"Processing {channel_type} webhook")
         
-        # Parse and validate the Twilio request
-        twilio_request = parse_twilio_request(event, logger)
-        validate_twilio_signature(event, twilio_request, logger)
+        # Use factory to get appropriate parser
+        parser = WebhookParserFactory.get_parser(channel_type, event, logger)
         
-        # Extract key information from the request
-        sender_number = extract_sender_number(twilio_request)
-        message_body = extract_message_body(twilio_request)
+        # Validate webhook authenticity
+        if not parser.validate():
+            logger.warning("Invalid webhook signature")
+            return create_error_response(401, "Invalid signature")
+        
+        # Parse webhook data
+        webhook_data = parser.parse()
+        logger.info("Webhook parsed successfully", 
+                   extra={"sender_id": webhook_data['sender_id'], 
+                          "message_id": webhook_data['message_id']})
         
         # Look up conversation in DynamoDB
-        conversation = lookup_conversation(sender_number, logger)
+        conversation = lookup_conversation(webhook_data['sender_id'], channel_type, logger)
         
-        # Determine routing based on conversation state
-        if should_route_to_human(conversation):
-            # Send to human handoff queue
-            send_to_human_handoff_queue(twilio_request, conversation, logger)
-        else:
-            # Send to AI processing queue
-            send_to_ai_processing_queue(twilio_request, conversation, logger)
+        # Update conversation with the incoming message
+        update_conversation_with_message(conversation, webhook_data, logger)
         
-        # Return success response to Twilio
-        return create_twilio_response(True)
-    
-    except InvalidSignatureError:
-        logger.warning("Invalid Twilio signature")
-        return create_error_response(401, "Invalid signature")
-    
+        # Create the context object
+        context_object = create_context_object(webhook_data, conversation, logger)
+        
+        # Route to appropriate queue based on conversation state and channel
+        route_to_queue(context_object, logger)
+        
+        # Return appropriate response based on channel
+        return create_channel_response(channel_type, True)
+        
     except ConversationNotFoundError:
-        logger.warning(f"No conversation found for {sender_number}")
-        # Consider how to handle unknown senders
-        return create_twilio_response(True)  # Still return 200 to Twilio
+        logger.warning(f"No conversation found for sender", 
+                      extra={"sender_id": webhook_data.get('sender_id', 'unknown')})
+        # Handle unknown sender (implement rate-limited fallback)
+        return handle_unknown_sender(channel_type, webhook_data)
     
     except Exception as e:
         logger.error(f"Unhandled exception: {str(e)}", exc_info=True)
         return create_error_response(500, "Internal server error")
 ```
 
-## 3. Key Components and Modules
-
-### 3.1 Request Parsing and Validation
-
-#### Twilio Request Parsing
+### 3.2 Conversation Record Update
 
 ```python
-def parse_twilio_request(event, logger):
+def update_conversation_with_message(conversation, webhook_data, logger):
     """
-    Parse the API Gateway event to extract the Twilio webhook data.
+    Update the conversation record in DynamoDB with the incoming message.
     
     Args:
-        event (dict): API Gateway event
+        conversation (dict): Existing conversation record
+        webhook_data (dict): Parsed webhook data
         logger: Logger instance
-        
+    
     Returns:
-        dict: Parsed Twilio request parameters
-    """
-    # Handle both application/x-www-form-urlencoded and JSON payloads
-    if event.get('body'):
-        # Check if body is URL-encoded form data
-        body = event['body']
-        content_type = get_header_value(event, 'Content-Type')
-        
-        if 'application/x-www-form-urlencoded' in content_type:
-            # Parse URL-encoded form data
-            return parse_qs(body)
-        elif 'application/json' in content_type:
-            # Parse JSON data
-            return json.loads(body)
-    
-    logger.error("Unsupported or missing request body")
-    raise InvalidRequestError("Unsupported or missing request body")
-```
-
-#### Twilio Signature Validation
-
-```python
-def validate_twilio_signature(event, parsed_request, logger):
-    """
-    Validate that the request came from Twilio using the X-Twilio-Signature header.
-    
-    Args:
-        event (dict): API Gateway event
-        parsed_request (dict): Parsed Twilio request
-        logger: Logger instance
-        
-    Raises:
-        InvalidSignatureError: If signature validation fails
-    """
-    # Extract the Twilio signature from headers
-    twilio_signature = get_header_value(event, 'X-Twilio-Signature')
-    if not twilio_signature:
-        logger.warning("Missing X-Twilio-Signature header")
-        raise InvalidSignatureError("Missing Twilio signature")
-    
-    # Get the full request URL from API Gateway event
-    request_url = construct_request_url(event)
-    
-    # Get Twilio auth token from Secrets Manager
-    auth_token = get_twilio_auth_token()
-    
-    # Validate the signature
-    validator = RequestValidator(auth_token)
-    if not validator.validate(request_url, parsed_request, twilio_signature):
-        logger.warning("Invalid Twilio signature")
-        raise InvalidSignatureError("Invalid Twilio signature")
-    
-    logger.info("Twilio signature validation successful")
-```
-
-### 3.2 Data Extraction
-
-```python
-def extract_sender_number(twilio_request):
-    """
-    Extract the sender's WhatsApp number from the Twilio request.
-    
-    Args:
-        twilio_request (dict): Parsed Twilio request
-        
-    Returns:
-        str: Sender's phone number in E.164 format
-    """
-    # Twilio sends WhatsApp numbers in the format "whatsapp:+1234567890"
-    from_field = twilio_request.get('From', [''])[0]
-    
-    # Extract just the number part
-    if from_field.startswith('whatsapp:'):
-        return from_field.split('whatsapp:')[1]
-    
-    return from_field  # Fallback to the full value
-
-def extract_message_body(twilio_request):
-    """
-    Extract the message body from the Twilio request.
-    
-    Args:
-        twilio_request (dict): Parsed Twilio request
-        
-    Returns:
-        str: Message body text
-    """
-    return twilio_request.get('Body', [''])[0]
-```
-
-### 3.3 DynamoDB Conversation Lookup
-
-```python
-def lookup_conversation(sender_number, logger):
-    """
-    Look up the conversation record in DynamoDB using the sender's number.
-    
-    Args:
-        sender_number (str): Sender's phone number
-        logger: Logger instance
-        
-    Returns:
-        dict: Conversation record from DynamoDB
-        
-    Raises:
-        ConversationNotFoundError: If no matching conversation is found
+        dict: Updated conversation record
     """
     try:
         # Initialize DynamoDB client
         dynamodb = boto3.resource('dynamodb')
         table = dynamodb.Table(os.environ['CONVERSATIONS_TABLE'])
         
-        # Query by recipient_tel (phone number)
-        # Use a GSI if not part of the main key
-        response = table.query(
-            IndexName='recipient-tel-index',  # Secondary index on recipient_tel
-            KeyConditionExpression=Key('recipient_tel').eq(sender_number),
-            ScanIndexForward=False,  # Sort by newest first if using a sort key
-            Limit=1  # We just need the most recent conversation
+        # Format the new message
+        new_message = {
+            "message_id": webhook_data['message_id'],
+            "direction": "INBOUND",
+            "content": webhook_data['message_content'],
+            "timestamp": webhook_data['timestamp'],
+            "channel_type": webhook_data['channel_type'],
+            "metadata": {
+                # Channel-specific metadata
+                "sender": webhook_data['sender_id'],
+                "recipient": webhook_data['recipient_id']
+            }
+        }
+        
+        # Update the conversation with the new message
+        response = table.update_item(
+            Key={
+                'conversation_id': conversation['conversation_id'],
+                'primary_channel': conversation['primary_channel']
+            },
+            UpdateExpression="SET messages = list_append(if_not_exists(messages, :empty_list), :new_message), "
+                            "conversation_status = :status, "
+                            "last_user_message_at = :timestamp, "
+                            "last_activity_at = :timestamp",
+            ExpressionAttributeValues={
+                ':new_message': [new_message],
+                ':empty_list': [],
+                ':status': 'user_reply_received',
+                ':timestamp': webhook_data['timestamp']
+            },
+            ReturnValues="ALL_NEW"
         )
         
-        if not response.get('Items'):
-            logger.warning(f"No conversation found for {sender_number}")
-            raise ConversationNotFoundError(f"No conversation found for {sender_number}")
+        logger.info("Conversation updated with new message", 
+                  extra={"conversation_id": conversation['conversation_id']})
         
-        # Return the most recent conversation
-        return response['Items'][0]
+        # Return the updated conversation
+        return response.get('Attributes', conversation)
     
     except ClientError as e:
-        logger.error(f"DynamoDB error: {str(e)}")
+        logger.error(f"Failed to update conversation: {str(e)}")
         raise
 ```
 
-### 3.4 Routing Logic
+### 3.3 Context Object Creation
 
 ```python
-def should_route_to_human(conversation):
+def create_context_object(webhook_data, conversation, logger):
     """
-    Determine if the conversation should be routed to human handoff.
+    Create a standardized context object for processing.
     
     Args:
-        conversation (dict): Conversation record from DynamoDB
-        
+        webhook_data (dict): Parsed webhook data
+        conversation (dict): Conversation record
+        logger: Logger instance
+    
     Returns:
-        bool: True if should route to human, False otherwise
+        dict: Context object
     """
-    # Check the handoff_to_human flag in the conversation record
-    return conversation.get('handoff_to_human', False)
-
-def send_to_human_handoff_queue(twilio_request, conversation, logger):
-    """
-    Send the message to the human handoff SQS queue.
+    # Generate a unique request ID
+    request_id = str(uuid.uuid4())
     
-    Args:
-        twilio_request (dict): Parsed Twilio request
-        conversation (dict): Conversation record from DynamoDB
-        logger: Logger instance
-    """
-    # Create the message payload
-    payload = {
-        'twilio_message': twilio_request,
-        'conversation_id': conversation.get('conversation_id'),
-        'thread_id': conversation.get('thread_id'),
-        'company_id': conversation.get('company_id'),
-        'project_id': conversation.get('project_id'),
-        'timestamp': datetime.utcnow().isoformat(),
-        'channel': 'whatsapp'
+    # Build the context object
+    context = {
+        "meta": {
+            "request_id": request_id,
+            "channel_type": webhook_data['channel_type'],
+            "timestamp": datetime.utcnow().isoformat(),
+            "version": "1.0"
+        },
+        "conversation": {
+            "conversation_id": conversation['conversation_id'],
+            "primary_channel": conversation['primary_channel'],
+            "conversation_status": conversation['conversation_status'],
+            "hand_off_to_human": conversation.get('hand_off_to_human', False),
+            "thread_id": conversation.get('thread_id')
+        },
+        "message": {
+            "from": webhook_data['sender_id'],
+            "to": webhook_data['recipient_id'],
+            "body": webhook_data['message_content'],
+            "message_id": webhook_data['message_id'],
+            "timestamp": webhook_data['timestamp']
+        },
+        "company": {
+            "company_id": conversation.get('company_id'),
+            "project_id": conversation.get('project_id'),
+            "company_name": conversation.get('company_name'),
+            "credentials_reference": conversation.get('credentials_reference')
+        },
+        "processing": {
+            "validation_status": "valid",
+            "ai_response": None,
+            "sent_response": None,
+            "processing_timestamps": {
+                "received": webhook_data['timestamp'],
+                "validated": datetime.utcnow().isoformat(),
+                "queued": None  # Will be set when queued
+            }
+        }
     }
     
-    # Send to the human handoff queue
-    sqs_client = boto3.client('sqs')
-    queue_url = os.environ['HUMAN_HANDOFF_QUEUE_URL']
+    logger.info("Created context object", 
+               extra={"request_id": request_id, "conversation_id": conversation['conversation_id']})
     
-    response = sqs_client.send_message(
-        QueueUrl=queue_url,
-        MessageBody=json.dumps(payload)
-    )
-    
-    logger.info(f"Message sent to human handoff queue: {response['MessageId']}")
-
-def send_to_ai_processing_queue(twilio_request, conversation, logger):
-    """
-    Send the message to the AI processing SQS queue.
-    
-    Args:
-        twilio_request (dict): Parsed Twilio request
-        conversation (dict): Conversation record from DynamoDB
-        logger: Logger instance
-    """
-    # Create the message payload
-    payload = {
-        'twilio_message': twilio_request,
-        'conversation_id': conversation.get('conversation_id'),
-        'thread_id': conversation.get('thread_id'),
-        'company_id': conversation.get('company_id'),
-        'project_id': conversation.get('project_id'),
-        'timestamp': datetime.utcnow().isoformat(),
-        'channel': 'whatsapp'
-    }
-    
-    # Send to the AI processing queue
-    sqs_client = boto3.client('sqs')
-    queue_url = os.environ['WHATSAPP_REPLIES_QUEUE_URL']
-    
-    response = sqs_client.send_message(
-        QueueUrl=queue_url,
-        MessageBody=json.dumps(payload),
-        DelaySeconds=30  # 30-second delay to allow for message batching
-    )
-    
-    logger.info(f"Message sent to AI processing queue: {response['MessageId']}")
+    return context
 ```
 
-### 3.5 Response Generation
+### 3.4 Queue Routing
 
 ```python
-def create_twilio_response(success=True):
+def route_to_queue(context_object, logger):
     """
-    Create an API Gateway response suitable for Twilio.
+    Route the context object to the appropriate SQS queue.
     
     Args:
+        context_object (dict): The context object
+        logger: Logger instance
+    """
+    # Get relevant data from context
+    conversation = context_object['conversation']
+    channel_type = context_object['meta']['channel_type']
+    
+    # Initialize SQS client
+    sqs = boto3.client('sqs')
+    
+    # Get environment variables and stage name
+    stage = os.environ.get('STAGE', 'dev')
+    
+    # Determine which queue to use based on conversation state
+    if conversation.get('hand_off_to_human', False):
+        # Route to human handoff queue
+        queue_url = os.environ.get(f'{channel_type.upper()}_HANDOFF_QUEUE_URL')
+        delay_seconds = 0  # No delay for human handoff
+    else:
+        # Route to AI processing queue
+        queue_url = os.environ.get(f'{channel_type.upper()}_REPLIES_QUEUE_URL')
+        delay_seconds = 30  # 30-second delay for message batching
+    
+    # Update the queued timestamp
+    context_object['processing']['processing_timestamps']['queued'] = datetime.utcnow().isoformat()
+    
+    # Send to the queue
+    response = sqs.send_message(
+        QueueUrl=queue_url,
+        MessageBody=json.dumps(context_object),
+        DelaySeconds=delay_seconds
+    )
+    
+    logger.info("Message sent to queue", 
+               extra={"queue": queue_url, 
+                      "message_id": response['MessageId'],
+                      "conversation_id": conversation['conversation_id']})
+```
+
+## 4. Lambda Configuration and Resources
+
+### 4.1 Memory and Timeout Settings
+
+```yaml
+Resources:
+  IncomingWebhookHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./src/webhook_handler
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      MemorySize: 512  # Sufficient for webhook processing
+      Timeout: 15      # 15-second timeout
+      Environment:
+        Variables:
+          CONVERSATIONS_TABLE: !Ref ConversationsTable
+          WHATSAPP_REPLIES_QUEUE_URL: !Ref WhatsAppRepliesQueue
+          SMS_REPLIES_QUEUE_URL: !Ref SmsRepliesQueue
+          EMAIL_REPLIES_QUEUE_URL: !Ref EmailRepliesQueue
+          WHATSAPP_HANDOFF_QUEUE_URL: !Ref WhatsAppHandoffQueue
+          SMS_HANDOFF_QUEUE_URL: !Ref SmsHandoffQueue
+          EMAIL_HANDOFF_QUEUE_URL: !Ref EmailHandoffQueue
+          STAGE: !Ref Stage
+          LOG_LEVEL: INFO
+```
+
+### 4.2 Performance Optimization
+
+- Size the Lambda appropriately to handle all channel types
+- The memory allocation of 512MB provides sufficient resources for webhook processing
+- The timeout value of 15 seconds accommodates all possible execution paths
+- DynamoDB request timeouts are set to 2 seconds with retries
+- SQS message size limits are respected (max 256KB)
+
+### 4.3 Cold Start Mitigation
+
+- Keep dependencies minimal
+- Initialize AWS clients outside the handler function
+- Consider using Provisioned Concurrency for production
+- Optimize import statements for faster initialization
+
+## 5. Channel-Specific Response Handling
+
+```python
+def create_channel_response(channel_type, success=True):
+    """
+    Create an API Gateway response suitable for the specific channel.
+    
+    Args:
+        channel_type (str): The communication channel type
         success (bool): Whether to return a success response
         
     Returns:
         dict: API Gateway response object
     """
-    # Basic TwiML response that acknowledges receipt
-    twiml_response = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
+    if channel_type in ['whatsapp', 'sms']:
+        # Twilio expects a TwiML response
+        response_body = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
+        content_type = 'text/xml'
+    elif channel_type == 'email':
+        # Email webhook response
+        response_body = json.dumps({'success': success})
+        content_type = 'application/json'
+    else:
+        # Default JSON response
+        response_body = json.dumps({'success': success})
+        content_type = 'application/json'
     
     return {
         'statusCode': 200,
         'headers': {
-            'Content-Type': 'text/xml'
+            'Content-Type': content_type
         },
-        'body': twiml_response
-    }
-
-def create_error_response(status_code, message):
-    """
-    Create an error response for API Gateway.
-    
-    Args:
-        status_code (int): HTTP status code
-        message (str): Error message
-        
-    Returns:
-        dict: API Gateway response object
-    """
-    return {
-        'statusCode': status_code,
-        'headers': {
-            'Content-Type': 'application/json'
-        },
-        'body': json.dumps({
-            'error': message
-        })
+        'body': response_body
     }
 ```
 
-## 4. Custom Exception Types
+## 6. Error Handling and Fallbacks
+
+### 6.1 Unknown Sender Handling
+
+```python
+def handle_unknown_sender(channel_type, webhook_data):
+    """
+    Handle messages from unknown senders with rate-limited fallbacks.
+    
+    Args:
+        channel_type (str): The communication channel type
+        webhook_data (dict): Parsed webhook data
+        
+    Returns:
+        dict: API Gateway response
+    """
+    sender_id = webhook_data['sender_id']
+    
+    # Check if we've already sent a fallback recently using DynamoDB with TTL
+    if has_received_fallback_recently(sender_id):
+        logger.info(f"Ignoring repeat unknown sender", extra={"sender_id": sender_id})
+        return create_channel_response(channel_type, True)
+    
+    # Send appropriate channel-specific fallback
+    if channel_type == 'whatsapp':
+        send_whatsapp_fallback(sender_id)
+    elif channel_type == 'sms':
+        send_sms_fallback(sender_id)
+    elif channel_type == 'email':
+        send_email_fallback(sender_id)
+    
+    # Record fallback timestamp with TTL
+    record_fallback_sent(sender_id)
+    
+    # Return success response to the channel
+    return create_channel_response(channel_type, True)
+```
+
+### 6.2 Enhanced Exception Types
 
 ```python
 class WebhookHandlerError(Exception):
     """Base exception class for webhook handler errors."""
     pass
 
-class InvalidRequestError(WebhookHandlerError):
-    """Exception raised when the request format is invalid."""
+class UnsupportedChannelError(WebhookHandlerError):
+    """Exception raised when the channel type is not supported."""
     pass
 
-class InvalidSignatureError(WebhookHandlerError):
-    """Exception raised when the Twilio signature validation fails."""
+class ValidationError(WebhookHandlerError):
+    """Exception raised when webhook validation fails."""
     pass
 
 class ConversationNotFoundError(WebhookHandlerError):
-    """Exception raised when no matching conversation is found in DynamoDB."""
+    """Exception raised when no matching conversation is found."""
+    pass
+
+class QueueRoutingError(WebhookHandlerError):
+    """Exception raised when message cannot be routed to a queue."""
     pass
 ```
 
-## 5. Configuration and Environment Variables
+## 7. Deployment and Testing Considerations
 
-| Environment Variable | Description | Example Value |
-|---------------------|-------------|--------------|
-| `CONVERSATIONS_TABLE` | Name of the DynamoDB table storing conversations | `ai-multi-comms-conversations-dev` |
-| `WHATSAPP_REPLIES_QUEUE_URL` | URL of the SQS queue for AI processing | `https://sqs.us-east-1.amazonaws.com/123456789012/ai-multi-comms-whatsapp-replies-queue-dev` |
-| `HUMAN_HANDOFF_QUEUE_URL` | URL of the SQS queue for human handoff | `https://sqs.us-east-1.amazonaws.com/123456789012/ai-multi-comms-human-handoff-queue-dev` |
-| `SECRETS_MANAGER_REGION` | AWS region for Secrets Manager | `us-east-1` |
-| `TWILIO_AUTH_TOKEN_SECRET_ID` | ID of the Secret containing the Twilio auth token | `ai-multi-comms/whatsapp-credentials/company/project/twilio-auth-token` |
-| `LOG_LEVEL` | Logging level | `INFO` |
+### 7.1 Testing Strategy
 
-## 6. File Structure
+- Unit tests for each parser implementation
+- Integration tests with mock webhook payloads
+- End-to-end tests with real API Gateway events
+- Load testing to verify memory and timeout settings
 
-```
-src_dev/
-└── webhook_handler/
-    └── app/
-        ├── requirements.txt
-        └── lambda_pkg/
-            ├── __init__.py
-            ├── index.py                # Main handler
-            ├── utils/
-            │   ├── __init__.py
-            │   ├── logger.py           # Logging utilities
-            │   ├── request_parser.py   # Request parsing utilities
-            │   └── response_builder.py # Response utilities
-            ├── services/
-            │   ├── __init__.py
-            │   ├── dynamodb_service.py # DynamoDB interactions
-            │   ├── sqs_service.py      # SQS interactions
-            │   └── secrets_service.py  # Secrets Manager interactions
-            └── validators/
-                ├── __init__.py
-                └── twilio_validator.py # Signature validation
-```
+### 7.2 Monitoring and Metrics
 
-## 7. Dependencies
+- CloudWatch metrics for:
+  - Invocation count by channel type
+  - Error rates by error type
+  - Processing duration
+  - Queue routing success/failure
+  - Unknown sender count
 
-```
-# AWS SDK
-boto3==1.26.153
-botocore==1.29.153
+### 7.3 Logging Strategy
 
-# API and Lambda Function
-pydantic==2.0.2
+- JSON-structured logs with context fields
+- Consistent logging across all components
+- Redaction of sensitive information
+- Log levels appropriate to the operation
 
-# Twilio
-twilio==8.5.0
+## 8. Next Steps
 
-# Utilities
-structlog==23.1.0
-```
-
-## 8. Error Handling & Logging Strategy
-
-### 8.1 Logging Strategy
-
-- Use structured logging with `structlog` for easier log analysis
-- Include conversation_id, request_id, and other context in all log entries
-- Log at appropriate levels:
-  - DEBUG: Details useful for debugging
-  - INFO: Normal flow events
-  - WARNING: Potential issues (like missing conversations)
-  - ERROR: Issues that prevent normal processing
-
-### 8.2 Error Handling Strategy
-
-- Use custom exception types for clear error categorization
-- Specific handling for each error type
-- Catch-all for unexpected errors to prevent Lambda failures
-- Return appropriate HTTP status codes based on error type
-- Always log errors with full context
-
-## 9. Performance Considerations
-
-### 9.1 Lambda Configuration
-
-- Memory: 256 MB (sufficient for webhook handling)
-- Timeout: 10 seconds (more than enough for this processing)
-- Concurrency: Default (can be increased if needed)
-
-### 9.2 DynamoDB Access
-
-- Use GSIs effectively to enable fast lookups by recipient phone number
-- Implement retries with exponential backoff for DynamoDB operations
-
-### 9.3 Cold Start Optimization
-
-- Keep code size minimal
-- Initialize AWS clients outside the handler function
-- Consider Provisioned Concurrency for production
-
-## 10. Security Considerations
-
-### 10.1 Signature Validation
-
-- Always validate Twilio signatures
-- Use correct request URL in validation (including query parameters)
-- Fail closed (reject requests if validation fails)
-
-### 10.2 Secrets Management
-
-- Store Twilio auth tokens in AWS Secrets Manager
-- Use IAM role with least privilege access to secrets
-- Do not log sensitive information
-
-### 10.3 Input Validation
-
-- Validate all input parameters
-- Sanitize inputs to prevent injection attacks
-- Validate payload structure
-
-## 11. Testing Strategy
-
-### 11.1 Unit Tests
-
-```python
-# Example unit test for signature validation
-def test_validate_twilio_signature_valid():
-    # Mock event with valid signature
-    event = {
-        'headers': {
-            'X-Twilio-Signature': 'valid_signature'
-        },
-        'body': 'Body=Test&From=whatsapp%3A%2B1234567890',
-        'requestContext': {
-            'path': '/whatsapp',
-            'domainName': 'example.execute-api.us-east-1.amazonaws.com',
-            'stage': 'dev'
-        }
-    }
-    
-    # Mock dependencies
-    parsed_request = {'Body': ['Test'], 'From': ['whatsapp:+1234567890']}
-    logger = MagicMock()
-    
-    # Mock the validator
-    with patch('twilio.request_validator.RequestValidator.validate', return_value=True):
-        with patch('lambda_pkg.services.secrets_service.get_twilio_auth_token', return_value='mock_token'):
-            # Should not raise exception
-            validate_twilio_signature(event, parsed_request, logger)
-```
-
-### 11.2 Integration Tests
-
-- Test with real DynamoDB tables (using localstack)
-- Test with real SQS queues (using localstack)
-- Test end-to-end flow with mock Twilio requests
-
-### 11.3 Mock Strategies
-
-- Mock AWS services for unit tests
-- Use moto for AWS service mocking
-- Create fixtures for common test data
-
-## 12. Deployment Considerations
-
-### 12.1 IAM Permissions
-
-Minimum required permissions:
-- `dynamodb:Query` on the ConversationsTable
-- `sqs:SendMessage` on the WhatsAppRepliesQueue and HumanHandoffQueue
-- `secretsmanager:GetSecretValue` on the Twilio auth token secret
-
-### 12.2 Resource Naming
-
-- Lambda Function: `${ProjectPrefix}-incoming-webhook-handler-${EnvironmentName}`
-- Log Group: `/aws/lambda/${ProjectPrefix}-incoming-webhook-handler-${EnvironmentName}`
-
-## 13. Happy Path Analysis
-
-### 13.1 Preconditions
-
-- API Gateway is configured to forward requests to this Lambda
-- DynamoDB table contains conversation records
-- SQS queues are configured and accessible
-- Twilio auth token is stored in Secrets Manager
-
-### 13.2 Flow
-
-1. Webhook arrives from Twilio with valid signature
-2. Lambda parses the request and extracts sender information
-3. Lambda looks up the conversation in DynamoDB
-4. Lambda determines routing based on handoff_to_human flag
-5. Lambda sends the message to the appropriate SQS queue
-6. Lambda returns a 200 OK response with TwiML
-
-### 13.3 Expected Outcome
-
-- Message is successfully sent to the correct queue
-- Twilio receives a 200 OK response
-- Complete transaction takes < 500ms
-
-## 14. Unhappy Path Analysis
-
-### 14.1 Invalid Signature
-
-1. Webhook arrives with invalid signature
-2. Signature validation fails
-3. Lambda returns 401 Unauthorized
-4. Error is logged
-
-### 14.2 Conversation Not Found
-
-1. Webhook arrives with valid signature
-2. No matching conversation is found in DynamoDB
-3. ConversationNotFoundError is caught
-4. Lambda still returns a 200 OK to Twilio
-5. Warning is logged
-6. (Optional) Create a new conversation or implement specific handling
-
-### 14.3 DynamoDB Failure
-
-1. Webhook arrives with valid signature
-2. DynamoDB query fails (service error)
-3. Exception is caught
-4. Lambda returns 500 Internal Server Error
-5. Error is logged with full context
-
-## 15. Next Steps
-
-1. Implement Lambda code according to this design
-2. Create unit tests for all components
-3. Set up local test environment with localstack
-4. Deploy to AWS using CLI
-5. Test with mock Twilio requests
-6. Document actual implementation details 
+1. Implement the IncomingWebhookHandler Lambda with multi-channel support
+2. Create unit and integration tests for all parsers and workflows
+3. Set up monitoring and alarming for production use
+4. Implement additional channel parsers as needed
+5. Document operational procedures for troubleshooting 

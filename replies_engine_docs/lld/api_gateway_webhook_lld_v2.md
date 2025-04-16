@@ -34,7 +34,7 @@ Each endpoint will have its own specific request validation model and integratio
 ### Channel-Specific Routing
 
 - **Path Parameters**: The channel type is determined by the URL path (/whatsapp, /sms, /email)
-- **Lambda Integration**: Each channel may be integrated with its own Lambda function or a single function with internal routing
+- **Lambda Integration**: All routes will integrate with a single Lambda function with internal routing logic
 - **Initial Release**: Only the WhatsApp endpoint will be fully implemented, with placeholder resources for SMS and email
 
 ## 3. Security Implementation
@@ -117,172 +117,40 @@ Usage plans will be implemented to protect against denial-of-service attacks and
 - Configure CloudWatch alarms to alert on high throttling events
 - Review and adjust limits based on actual usage patterns
 
-## 4. Webhook Processing Flow
+## 4. Lambda Integration
 
-### 4.1 Conversation Record Processing
+### 4.1 Integration Type
 
-The `IncomingWebhookHandler` Lambda function performs initial processing for all incoming webhooks regardless of channel type, following a standardized flow:
+- **Type**: `AWS_PROXY` (Lambda Proxy Integration)
+- **Lambda Function**: One single `IncomingWebhookHandler` function for all channels
+- **Content Handling**: `CONVERT_TO_TEXT` (API Gateway passes form data as-is to Lambda)
 
-**Conversation Lookup and Update Flow:**
-1. Extract sender's contact information from the webhook payload based on channel type:
-   - WhatsApp/SMS: `From` parameter from Twilio payload
-   - Email: Sender address from email headers
-2. Query DynamoDB to find the corresponding conversation record using the sender identifier
-3. If record exists:
-   - Update the conversation record with the incoming message:
-     ```python
-     # Simplified pseudo-code
-     update_expression = "SET messages = list_append(messages, :new_message), 
-                          conversation_status = :status,
-                          last_user_message_at = :timestamp,
-                          last_activity_at = :timestamp"
-     
-     expression_values = {
-         ":new_message": [{
-             "message_id": webhook_data.message_id,
-             "direction": "INBOUND",
-             "content": webhook_data.body,
-             "timestamp": current_timestamp,
-             "channel_type": channel_type,
-             "metadata": {...}  # Channel-specific metadata
-         }],
-         ":status": "user_reply_received",
-         ":timestamp": current_timestamp
-     }
-     ```
-   - This update is performed as an atomic operation to ensure the message is recorded even if subsequent processing fails
-4. If record does not exist:
-   - Log the unknown sender attempt
-   - Implement rate-limited fallback messaging (max 1 response per sender per 24h)
-   - Return early without further processing
+### 4.2 Request/Response Flow
 
-**Context Object Creation:**
-1. After the record update, retrieve the complete conversation record with all associated data
-2. Construct a comprehensive context object containing:
-   - Message details from the webhook
-   - Conversation data (ID, status, thread_id, etc.)
-   - Company and project information from the record
-   - Channel-specific configuration (credentials reference, templates, etc.)
-   - Processing metadata (timestamps, validation status, request IDs)
+1. API Gateway receives the webhook request and validates headers/format
+2. The request is passed to the Lambda function with channel information
+3. Lambda processes the request based on channel type and content (see `IncomingWebhookHandler` LLD for details)
+4. Lambda returns an appropriate response for the channel
+5. API Gateway forwards the response back to the sender
 
-**Channel and Queue Routing:**
-1. Determine the appropriate processing path based on multiple factors:
-   - Check `handoff_to_human` flag in the conversation record
-   - Examine `channel_method` to identify channel-specific processing needs (whatsapp, sms, email)
-   - Verify conversation status is valid for further processing
-2. Based on these factors, route to the appropriate SQS queue:
-   ```python
-   if handoff_to_human:
-       # Route to human agent queue
-       sqs.send_message(
-           QueueUrl=f"ai-multi-comms-{channel_method}-handoff-queue-{stage}",
-           MessageBody=json.dumps(context_object)
-       )
-   else:
-       # Route to AI processing queue
-       sqs.send_message(
-           QueueUrl=f"ai-multi-comms-{channel_method}-replies-queue-{stage}",
-           MessageBody=json.dumps(context_object),
-           DelaySeconds=30  # Allow message batching
-       )
-   ```
+### 4.3 Execution Role
 
-**Single Lambda for Initial Processing:**
-- The `IncomingWebhookHandler` serves as a unified entry point for all channels
-- Channel-specific logic is isolated within well-defined sections of code
-- Configuration is externalized in environment variables and DynamoDB records
-- A factory pattern is used to select the appropriate message parser based on channel type
-- This approach reduces duplication while maintaining channel-specific handling when needed
-
-**Post-Queue Processing:**
-- After the SQS queue, channel-specific Lambdas handle the actual processing:
-  - `WhatsappReplyProcessorLambda`
-  - `SmsReplyProcessorLambda`
-  - `EmailReplyProcessorLambda`
-- This architecture mirrors the template-sender-engine design pattern
-- Each processor Lambda is optimized for channel-specific requirements while sharing common core logic through shared libraries
-
-### 4.2 Message Routing and Context Object
-
-A standardized context object will be created to track the message through the processing pipeline:
+The API Gateway requires permissions to invoke the Lambda function:
 
 ```json
 {
-  "meta": {
-    "request_id": "uuid-here",
-    "channel_type": "whatsapp",
-    "timestamp": "2023-06-01T12:34:56.789Z",
-    "version": "1.0"
-  },
-  "conversation": {
-    "conversation_id": "conversation-uuid",
-    "primary_channel": "+1234567890",
-    "conversation_status": "active",
-    "hand_off_to_human": false
-  },
-  "message": {
-    "from": "+1234567890",
-    "to": "+0987654321",
-    "body": "Hello there",
-    "message_id": "twilio-message-id",
-    "timestamp": "2023-06-01T12:34:50.123Z"
-  },
-  "company": {
-    "company_id": "company-123",
-    "project_id": "project-456",
-    "company_name": "Cucumber Recruitment",
-    "credentials_reference": "whatsapp-credentials/cucumber-recruitment/cv-analysis/twilio"
-  },
-  "processing": {
-    "validation_status": "valid",
-    "ai_response": null,
-    "sent_response": null,
-    "processing_timestamps": {
-      "received": "2023-06-01T12:34:56.789Z",
-      "validated": "2023-06-01T12:34:57.123Z",
-      "queued": "2023-06-01T12:34:57.456Z"
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": "arn:aws:lambda:${region}:${account-id}:function:${function-name}"
     }
-  }
+  ]
 }
 ```
 
-This context object will be placed on the appropriate SQS queue for further processing.
-
-## 5. Integration with Backend Systems
-
-### 5.1 Lambda Integration
-
-- **Integration Type**: `AWS_PROXY` (Lambda Proxy Integration)
-- **Lambda Function**: `IncomingWebhookHandler`
-- **Content Handling**: `CONVERT_TO_TEXT` (API Gateway passes form data as-is to Lambda)
-
-### 5.2 Database Integration
-
-- **Primary Table**: Messages will be stored in a DynamoDB table
-- **Schema Design**: 
-  - Partition Key: `primary_channel` (phone number or email)
-  - Sort Key: `conversation_id`
-  - GSI: `conversation_status` for efficient querying
-- **Access Pattern**: Query by sender identifier to retrieve conversation context
-
-### 5.3 Secrets Manager Integration
-
-- **Access Method**: Lambda retrieves credentials based on stored reference
-- **Credential Reference Format**: `{channel}-credentials/{company_name}/{project_name}/{provider}`
-- **Example**: `whatsapp-credentials/cucumber-recruitment/cv-analysis/twilio`
-
-### 5.4 SQS Integration
-
-- **Queues**:
-  - `WhatsAppRepliesQueue`: For messages to be processed by AI
-  - `HandoffQueue`: For messages requiring human intervention
-- **Configuration**:
-  - Standard queues with message delay (30 seconds)
-  - Visibility timeout: 2 minutes
-  - Dead-letter queue for failed processing
-  - Retention period: 14 days
-
-## 6. Response Handling
+## 5. Response Handling
 
 ### WhatsApp/SMS Response
 
@@ -303,31 +171,31 @@ Status: 200 OK
 
 Appropriate response format based on email provider requirements.
 
-## 7. Monitoring and Logging
+## 6. Monitoring and Logging
 
 ### CloudWatch Logging
 
 - **Log Level**: INFO for normal operations, ERROR for failures
-- **Structured Logging**: JSON format for easy querying and analysis
-- **Sensitive Data**: Mask sensitive information in logs
+- **Access Logging**: Enable API Gateway access logging
+- **Execution Logging**: Configure logging for all API stages
 
 ### CloudWatch Metrics
 
-- **Custom Metrics**:
-  - `WebhookValidationFailure` - Count of signature validation failures
-  - `UnknownSenderCount` - Count of messages from unknown senders
-  - `FallbackMessageSent` - Count of fallback messages sent
-  - `ProcessingTime` - Time taken to process each webhook
+- **Standard Metrics**:
+  - IntegrationLatency - Time between when API Gateway relays a request to the backend and when it receives a response
+  - Latency - Time between when API Gateway receives a request from a client and when it returns a response
+  - CacheHitCount/CacheMissCount - Not applicable (no caching enabled)
+  - Count - Total number of API requests in a given period
 
 ### Alerting
 
 - Set up alarms for:
-  - High rate of validation failures (potential attack)
-  - Excessive unknown sender messages
-  - Lambda errors or timeouts
-  - High API throttling events
+  - High 4XX or 5XX error rates
+  - Elevated latency
+  - Throttling events
+  - Quota limit approaching
 
-## 8. Deployment Strategy
+## 7. Deployment Strategy
 
 ### CloudFormation/SAM Template
 
@@ -372,30 +240,25 @@ Resources:
 - Incorporate environment-specific naming conventions
 - Deploy separate stacks for dev, staging, and production
 
-## 9. Testing Strategy
+## 8. Testing Strategy
 
-### Unit Testing
+### API Gateway Testing
 
-- Test message parsing logic in isolation
-- Test DynamoDB interaction patterns
-- Mock Secrets Manager for credential retrieval testing
+- Use API Gateway Test feature to send test requests
+- Verify request validation and models
+- Test throttling behavior
+- Validate CORS configuration
 
-### Integration Testing
+### End-to-End Testing
 
-- Use API Gateway Test feature to send test webhooks
-- Validate end-to-end flow with Twilio test credentials
-- Test rate limiting and throttling behavior
+- Send webhook requests from Twilio test accounts
+- Verify integration with Lambda and backend systems
+- Test error handling and response formatting
 
-### Load Testing
-
-- Simulate high volume of incoming webhooks
-- Verify throttling behavior works as expected
-- Measure performance under load
-
-## 10. Next Steps
+## 9. Next Steps
 
 1. Implement the API Gateway with WhatsApp endpoint and security measures
-2. Develop and deploy the IncomingWebhookHandler Lambda
-3. Set up monitoring and alerting
-4. Test with Twilio sandbox environment
-5. Plan for SMS and email endpoint implementation 
+2. Create request validators and models
+3. Configure usage plans and throttling
+4. Deploy and test with sample webhooks
+5. Extend to support SMS and email endpoints 
