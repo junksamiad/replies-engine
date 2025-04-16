@@ -7,9 +7,7 @@ The IncomingWebhookHandler Lambda function serves as the unified entry point for
 - Receiving and processing webhooks from multiple channels (WhatsApp/SMS via Twilio, email via SendGrid)
 - Parsing channel-specific payloads using a factory pattern approach
 - Looking up existing conversation records in DynamoDB using the sender's identifier
-- Updating conversation records with incoming message content and metadata
-- Creating a standardized context object for consistent processing
-- Routing messages to the appropriate SQS queue based on conversation state and channel type
+- Placing incoming messages on appropriate SQS queues with a delay for batching
 - Returning appropriate responses based on the originating channel
 
 ### 1.1 Design Goals
@@ -20,7 +18,7 @@ This Lambda function is designed with several key goals in mind:
 
 2. **Separation of Concerns**: While handling all channels initially, the function maintains clear boundaries between channel-specific logic through the parser factory design pattern.
 
-3. **Data Consistency**: Update conversation records as early as possible in the processing flow to ensure that even if later steps fail, the incoming message is properly recorded.
+3. **Message Batching**: Enable batching of rapid sequential messages by delaying processing and allowing multiple messages to accumulate.
 
 4. **Standardization**: Convert different webhook formats into a common context object structure that can be consistently processed by downstream components.
 
@@ -28,20 +26,19 @@ This Lambda function is designed with several key goals in mind:
 
 ### 1.2 Relationship to Other Components
 
-The IncomingWebhookHandler is positioned at the beginning of the webhook processing pipeline:
+The IncomingWebhookHandler is positioned at the beginning of a two-stage webhook processing pipeline:
 
 1. **Upstream**: Receives events directly from API Gateway, which performs initial request validation and throttling.
 
 2. **Downstream**: 
-   - Updates DynamoDB conversation records
-   - Sends messages to various SQS queues for further processing
-   - Indirectly triggers channel-specific Lambda functions through these queues
+   - Places messages onto SQS queues with a 30-second delay
+   - Triggers BatchProcessorLambda functions after the delay period
+   - BatchProcessor Lambdas then update DynamoDB and interact with AI services
 
 3. **Dependencies**:
-   - Relies on DynamoDB for conversation storage and retrieval
-   - Uses SQS for message routing and batching
-   - Accesses Secret Manager for channel-specific authentication
-   - Performs WebSocket notifications for real-time UI updates (optional)
+   - Relies on DynamoDB for conversation lookups (but not updates in this stage)
+   - Uses SQS for message queuing and batching
+   - BatchProcessor Lambdas handle DynamoDB updates after batching
 
 ## 2. Multi-Channel Processing Architecture
 
@@ -241,11 +238,11 @@ The specific implementation details for SendGrid webhooks would include:
 
 ## 3. Conversation Processing Flow
 
-The conversation processing flow represents the core business logic of the Lambda function. It follows a carefully designed sequence to ensure data consistency and proper message routing.
+The conversation processing flow follows a two-stage Lambda architecture to enable message batching and efficient processing.
 
 ### 3.1 Lambda Handler Function
 
-The main Lambda handler orchestrates the entire webhook processing pipeline. It implements a structured flow that works consistently across all channels while handling exceptions appropriately.
+The main Lambda handler focuses on receiving, validating, and queueing messages rather than performing database updates.
 
 ```python
 def lambda_handler(event, context):
@@ -282,17 +279,14 @@ def lambda_handler(event, context):
                    extra={"sender_id": webhook_data['sender_id'], 
                           "message_id": webhook_data['message_id']})
         
-        # Look up conversation in DynamoDB
-        conversation = lookup_conversation(webhook_data['sender_id'], channel_type, logger)
+        # Look up conversation in DynamoDB (only verify existence)
+        conversation = lookup_conversation_exists(webhook_data['sender_id'], channel_type, logger)
         
-        # Update conversation with the incoming message
-        update_conversation_with_message(conversation, webhook_data, logger)
+        # Create a simplified message context for queueing
+        message_context = create_message_context(webhook_data, conversation, logger)
         
-        # Create the context object
-        context_object = create_context_object(webhook_data, conversation, logger)
-        
-        # Route to appropriate queue based on conversation state and channel
-        route_to_queue(context_object, logger)
+        # Route to appropriate queue with delay for batching
+        route_to_batch_queue(message_context, logger)
         
         # Return appropriate response based on channel
         return create_channel_response(channel_type, True)
@@ -308,35 +302,236 @@ def lambda_handler(event, context):
         return create_error_response(500, "Internal server error")
 ```
 
-The handler flow follows a logical sequence designed for both efficiency and reliability:
+The key changes in this handler function are:
 
-1. **Logger Initialization**: Sets up structured logging with context information from the beginning
-2. **Channel Identification**: Determines which communication channel the webhook belongs to
-3. **Parser Selection**: Uses the factory pattern to obtain the appropriate webhook parser
-4. **Webhook Validation**: Verifies the authenticity of the webhook before any further processing
-5. **Payload Parsing**: Extracts and normalizes the webhook data into a standard format
-6. **Conversation Lookup**: Finds the associated conversation record in DynamoDB
-7. **Record Update**: Immediately updates the conversation with the new message (critical for data consistency)
-8. **Context Creation**: Builds a comprehensive context object for downstream processing
-9. **Queue Routing**: Sends the context object to the appropriate SQS queue based on conversation state
-10. **Response Generation**: Returns a channel-appropriate response to acknowledge receipt
+1. **Simplified Conversation Lookup**: Only verifies the conversation exists without retrieving the full record
+2. **No Conversation Update**: The function does not update the conversation record
+3. **Lighter Context Object**: Creates a simplified context with just the essential information
+4. **Message Queueing**: Places the message on a queue with a delay for batching
 
-Each step in this sequence is designed with specific error handling to ensure the system degrades gracefully when issues arise. The most critical operations—record lookup and update—happen early in the flow to ensure data is persisted even if later steps fail.
+### 3.2 Simplified Conversation Lookup
 
-### 3.2 Conversation Record Update
-
-One of the most critical responsibilities of the Lambda function is to immediately update the conversation record with the incoming message. This ensures that even if subsequent processing fails (e.g., SQS is unavailable), the user's message is not lost.
+The lookup function is simplified to only verify existence without retrieving the full record:
 
 ```python
-def update_conversation_with_message(conversation, webhook_data, logger):
+def lookup_conversation_exists(sender_id, channel_type, logger):
     """
-    Update the conversation record in DynamoDB with the incoming message.
+    Verify that a conversation exists for this sender.
     
     Args:
-        conversation (dict): Existing conversation record
-        webhook_data (dict): Parsed webhook data
+        sender_id (str): Sender's identifier (phone number, email)
+        channel_type (str): Communication channel type
         logger: Logger instance
     
+    Returns:
+        dict: Basic conversation metadata (ID, primary channel)
+        
+    Raises:
+        ConversationNotFoundError: If no matching conversation is found
+    """
+    try:
+        # Initialize DynamoDB client
+        dynamodb = boto3.resource('dynamodb')
+        table = dynamodb.Table(os.environ['CONVERSATIONS_TABLE'])
+        
+        # Query by sender ID (phone number, email)
+        response = table.query(
+            IndexName='sender-id-index',
+            KeyConditionExpression=Key('sender_id').eq(sender_id),
+            ProjectionExpression='conversation_id, primary_channel, company_id, project_id',
+            ScanIndexForward=False,
+            Limit=1
+        )
+        
+        if not response.get('Items'):
+            logger.warning(f"No conversation found for {sender_id}")
+            raise ConversationNotFoundError(f"No conversation found for {sender_id}")
+        
+        # Return minimal conversation metadata
+        return response['Items'][0]
+    
+    except ClientError as e:
+        logger.error(f"DynamoDB error: {str(e)}")
+        raise
+```
+
+This function only retrieves the minimal information needed to create a message context and performs a more efficient query with projection expression.
+
+### 3.3 Message Context Creation
+
+Instead of creating a comprehensive context object, this function creates a lightweight message context:
+
+```python
+def create_message_context(webhook_data, conversation_metadata, logger):
+    """
+    Create a lightweight message context for queueing.
+    
+    Args:
+        webhook_data (dict): Parsed webhook data
+        conversation_metadata (dict): Basic conversation metadata
+        logger: Logger instance
+    
+    Returns:
+        dict: Message context
+    """
+    # Generate a unique message ID
+    message_id = str(uuid.uuid4())
+    
+    # Build the message context
+    context = {
+        "meta": {
+            "message_id": message_id,
+            "channel_type": webhook_data['channel_type'],
+            "timestamp": datetime.utcnow().isoformat(),
+            "batch_id": None  # Will be set by batch processor
+        },
+        "conversation": {
+            "conversation_id": conversation_metadata['conversation_id'],
+            "primary_channel": conversation_metadata['primary_channel']
+        },
+        "message": {
+            "from": webhook_data['sender_id'],
+            "to": webhook_data['recipient_id'],
+            "body": webhook_data['message_content'],
+            "provider_message_id": webhook_data['message_id'],
+            "timestamp": webhook_data['timestamp']
+        },
+        "company": {
+            "company_id": conversation_metadata.get('company_id'),
+            "project_id": conversation_metadata.get('project_id')
+        }
+    }
+    
+    logger.info("Created message context", 
+               extra={"message_id": message_id, 
+                     "conversation_id": conversation_metadata['conversation_id']})
+    
+    return context
+```
+
+This context contains only the essential information needed for batching and subsequent processing.
+
+### 3.4 Queue Routing with Delay
+
+The queue routing function now focuses on adding a delay for batching:
+
+```python
+def route_to_batch_queue(message_context, logger):
+    """
+    Route the message context to the appropriate batch queue with delay.
+    
+    Args:
+        message_context (dict): The message context
+        logger: Logger instance
+    """
+    # Get relevant data from context
+    conversation_id = message_context['conversation']['conversation_id']
+    channel_type = message_context['meta']['channel_type']
+    
+    # Initialize SQS client
+    sqs = boto3.client('sqs')
+    
+    # Get environment variables and stage name
+    stage = os.environ.get('STAGE', 'dev')
+    
+    # Route to appropriate batch queue
+    queue_url = os.environ.get(f'{channel_type.upper()}_BATCH_QUEUE_URL')
+    delay_seconds = 30  # 30-second delay for message batching
+    
+    # Send to the batch queue
+    response = sqs.send_message(
+        QueueUrl=queue_url,
+        MessageBody=json.dumps(message_context),
+        DelaySeconds=delay_seconds,
+        MessageAttributes={
+            'ConversationId': {
+                'DataType': 'String',
+                'StringValue': conversation_id
+            }
+        }
+    )
+    
+    logger.info("Message sent to batch queue", 
+               extra={"queue": queue_url, 
+                      "message_id": message_context['meta']['message_id'],
+                      "delay_seconds": delay_seconds,
+                      "conversation_id": conversation_id})
+```
+
+This function adds message attributes to support filtering and correlation during batch processing.
+
+## 3.5 Batch Processing (Second Lambda)
+
+After the delay period, a second Lambda function processes messages in batches:
+
+```python
+def batch_processor_handler(event, context):
+    """
+    Handler for processing batched messages after delay.
+    
+    Args:
+        event (dict): SQS event containing messages
+        context (LambdaContext): AWS Lambda context
+    """
+    # Initialize logger
+    logger = setup_logger(context)
+    
+    # Extract messages from event
+    messages = [json.loads(record['body']) for record in event['Records']]
+    logger.info(f"Processing {len(messages)} messages")
+    
+    # Group messages by conversation ID
+    conversation_groups = {}
+    for message in messages:
+        conv_id = message['conversation']['conversation_id']
+        if conv_id not in conversation_groups:
+            conversation_groups[conv_id] = []
+        conversation_groups[conv_id].append(message)
+    
+    # Process each conversation's message batch
+    for conv_id, message_group in conversation_groups.items():
+        # Sort messages by timestamp
+        message_group.sort(key=lambda m: m['message']['timestamp'])
+        
+        # Generate batch ID
+        batch_id = str(uuid.uuid4())
+        
+        # Assign batch ID to all messages in group
+        for message in message_group:
+            message['meta']['batch_id'] = batch_id
+        
+        try:
+            # Update conversation in DynamoDB with all messages
+            conversation = update_conversation_with_batch(conv_id, message_group, logger)
+            
+            # Create comprehensive context for processing
+            context_object = create_processing_context(message_group, conversation, logger)
+            
+            # Route to appropriate processing queue
+            route_to_processing_queue(context_object, logger)
+            
+        except Exception as e:
+            logger.error(f"Failed to process batch for conversation {conv_id}: {str(e)}", 
+                        extra={"batch_id": batch_id, "message_count": len(message_group)},
+                        exc_info=True)
+```
+
+This batch processor groups messages by conversation ID, sorts them by timestamp, and updates the conversation record with all messages at once.
+
+### 3.6 Batch Update to Conversation
+
+The batch update function handles updating the conversation with multiple messages in a single operation:
+
+```python
+def update_conversation_with_batch(conversation_id, message_group, logger):
+    """
+    Update conversation with multiple messages in a single operation.
+    
+    Args:
+        conversation_id (str): Conversation identifier
+        message_group (list): Group of related messages
+        logger: Logger instance
+        
     Returns:
         dict: Updated conversation record
     """
@@ -345,244 +540,64 @@ def update_conversation_with_message(conversation, webhook_data, logger):
         dynamodb = boto3.resource('dynamodb')
         table = dynamodb.Table(os.environ['CONVERSATIONS_TABLE'])
         
-        # Format the new message
-        new_message = {
-            "message_id": webhook_data['message_id'],
-            "direction": "INBOUND",
-            "content": webhook_data['message_content'],
-            "timestamp": webhook_data['timestamp'],
-            "channel_type": webhook_data['channel_type'],
-            "metadata": {
-                # Channel-specific metadata
-                "sender": webhook_data['sender_id'],
-                "recipient": webhook_data['recipient_id']
-            }
-        }
+        # Get full conversation record
+        response = table.get_item(
+            Key={'conversation_id': conversation_id}
+        )
         
-        # Update the conversation with the new message
-        response = table.update_item(
-            Key={
-                'conversation_id': conversation['conversation_id'],
-                'primary_channel': conversation['primary_channel']
-            },
-            UpdateExpression="SET messages = list_append(if_not_exists(messages, :empty_list), :new_message), "
+        if 'Item' not in response:
+            raise ConversationNotFoundError(f"Conversation {conversation_id} not found")
+        
+        conversation = response['Item']
+        
+        # Format messages for database
+        new_messages = []
+        for message in message_group:
+            new_messages.append({
+                "message_id": message['meta']['message_id'],
+                "direction": "INBOUND",
+                "content": message['message']['body'],
+                "timestamp": message['message']['timestamp'],
+                "channel_type": message['meta']['channel_type'],
+                "batch_id": message['meta']['batch_id'],
+                "metadata": {
+                    "sender": message['message']['from'],
+                    "recipient": message['message']['to'],
+                    "provider_message_id": message['message']['provider_message_id']
+                }
+            })
+        
+        # Update conversation with all messages
+        update_response = table.update_item(
+            Key={'conversation_id': conversation_id},
+            UpdateExpression="SET messages = list_append(if_not_exists(messages, :empty_list), :new_messages), "
                             "conversation_status = :status, "
                             "last_user_message_at = :timestamp, "
-                            "last_activity_at = :timestamp",
+                            "last_activity_at = :timestamp, "
+                            "last_batch_id = :batch_id",
             ExpressionAttributeValues={
-                ':new_message': [new_message],
+                ':new_messages': new_messages,
                 ':empty_list': [],
                 ':status': 'user_reply_received',
-                ':timestamp': webhook_data['timestamp']
+                ':timestamp': datetime.utcnow().isoformat(),
+                ':batch_id': message_group[0]['meta']['batch_id']
             },
             ReturnValues="ALL_NEW"
-        }
+        )
         
-        logger.info("Conversation updated with new message", 
-                  extra={"conversation_id": conversation['conversation_id']})
+        logger.info(f"Conversation updated with {len(new_messages)} messages", 
+                   extra={"conversation_id": conversation_id, 
+                          "batch_id": message_group[0]['meta']['batch_id']})
         
-        # Return the updated conversation
-        return response.get('Attributes', conversation)
-    
+        # Return updated conversation
+        return update_response.get('Attributes', conversation)
+        
     except ClientError as e:
         logger.error(f"Failed to update conversation: {str(e)}")
         raise
 ```
 
-The record update function performs several important operations:
-
-1. **Message Formatting**: Structures the incoming message in a consistent format with required metadata
-2. **Atomic Update**: Uses DynamoDB's atomic update operations to append the message to the existing list
-3. **Status Transition**: Changes the conversation status to `user_reply_received` to indicate it's awaiting processing
-4. **Timestamp Updates**: Records when the user's message was received for tracking and SLA purposes
-5. **Error Handling**: Includes proper exception handling with detailed logging
-
-The update expression uses several important DynamoDB features:
-
-1. **list_append**: Adds the new message to the existing list of messages
-2. **if_not_exists**: Creates an empty message list if this is the first message in the conversation
-3. **ReturnValues**: Returns the updated record with all changes applied
-
-This approach ensures messages are reliably stored in chronological order and associated with the correct conversation, while the atomic update eliminates potential race conditions.
-
-### 3.3 Context Object Creation
-
-After updating the conversation record, the Lambda creates a comprehensive context object that will flow through the rest of the processing pipeline. This context object serves as a standardized container for all information needed by downstream components.
-
-```python
-def create_context_object(webhook_data, conversation, logger):
-    """
-    Create a standardized context object for processing.
-    
-    Args:
-        webhook_data (dict): Parsed webhook data
-        conversation (dict): Conversation record
-        logger: Logger instance
-    
-    Returns:
-        dict: Context object
-    """
-    # Generate a unique request ID
-    request_id = str(uuid.uuid4())
-    
-    # Build the context object
-    context = {
-        "meta": {
-            "request_id": request_id,
-            "channel_type": webhook_data['channel_type'],
-            "timestamp": datetime.utcnow().isoformat(),
-            "version": "1.0"
-        },
-        "conversation": {
-            "conversation_id": conversation['conversation_id'],
-            "primary_channel": conversation['primary_channel'],
-            "conversation_status": conversation['conversation_status'],
-            "hand_off_to_human": conversation.get('hand_off_to_human', False),
-            "thread_id": conversation.get('thread_id')
-        },
-        "message": {
-            "from": webhook_data['sender_id'],
-            "to": webhook_data['recipient_id'],
-            "body": webhook_data['message_content'],
-            "message_id": webhook_data['message_id'],
-            "timestamp": webhook_data['timestamp']
-        },
-        "company": {
-            "company_id": conversation.get('company_id'),
-            "project_id": conversation.get('project_id'),
-            "company_name": conversation.get('company_name'),
-            "credentials_reference": conversation.get('credentials_reference')
-        },
-        "processing": {
-            "validation_status": "valid",
-            "ai_response": null,
-            "sent_response": null,
-            "processing_timestamps": {
-                "received": webhook_data['timestamp'],
-                "validated": datetime.utcnow().isoformat(),
-                "queued": None  # Will be set when queued
-            }
-        }
-    }
-    
-    logger.info("Created context object", 
-               extra={"request_id": request_id, "conversation_id": conversation['conversation_id']})
-    
-    return context
-```
-
-The context object is carefully structured into logical sections:
-
-1. **Meta Section**: Contains metadata about the processing request itself
-   - **request_id**: Unique identifier for tracing this specific request through the system
-   - **channel_type**: Indicates which communication channel this message belongs to
-   - **timestamp**: When the context object was created
-   - **version**: Schema version for future compatibility
-
-2. **Conversation Section**: Contains the core conversation details
-   - **conversation_id**: Unique identifier for the conversation
-   - **primary_channel**: The main channel identifier (e.g., phone number)
-   - **conversation_status**: Current status of the conversation
-   - **hand_off_to_human**: Flag indicating if this conversation requires human intervention
-   - **thread_id**: OpenAI thread ID for AI-powered conversations
-
-3. **Message Section**: Contains details about the specific message being processed
-   - **from/to**: Sender and recipient identifiers
-   - **body**: The actual message content
-   - **message_id**: Channel-provided unique identifier for the message
-   - **timestamp**: When the message was sent/received
-
-4. **Company Section**: Contains organization-specific details
-   - **company_id/project_id**: Identifiers for the associated company and project
-   - **company_name**: Human-readable company name
-   - **credentials_reference**: Path to retrieve credentials from Secret Manager
-
-5. **Processing Section**: Contains processing state information
-   - **validation_status**: Indicates if the message passed validation
-   - **ai_response**: Placeholder for the AI's response (filled in later)
-   - **sent_response**: Placeholder for delivery confirmation (filled in later)
-   - **processing_timestamps**: Timeline of processing events
-
-This standardized structure provides several benefits:
-
-1. **Consistency**: All services operate on the same data structure regardless of channel
-2. **Self-Contained**: Contains all information needed for downstream processing
-3. **Traceability**: Includes identifiers and timestamps for monitoring and debugging
-4. **Forward Compatibility**: Structured to allow addition of new fields without breaking existing code
-
-### 3.4 Queue Routing
-
-Once the context object is created, the Lambda must determine which SQS queue to route it to based on conversation state and channel type. This routing is crucial as it determines how the message will be processed downstream.
-
-```python
-def route_to_queue(context_object, logger):
-    """
-    Route the context object to the appropriate SQS queue.
-    
-    Args:
-        context_object (dict): The context object
-        logger: Logger instance
-    """
-    # Get relevant data from context
-    conversation = context_object['conversation']
-    channel_type = context_object['meta']['channel_type']
-    
-    # Initialize SQS client
-    sqs = boto3.client('sqs')
-    
-    # Get environment variables and stage name
-    stage = os.environ.get('STAGE', 'dev')
-    
-    # Determine which queue to use based on conversation state
-    if conversation.get('hand_off_to_human', False):
-        # Route to human handoff queue
-        queue_url = os.environ.get(f'{channel_type.upper()}_HANDOFF_QUEUE_URL')
-        delay_seconds = 0  # No delay for human handoff
-    else:
-        # Route to AI processing queue
-        queue_url = os.environ.get(f'{channel_type.upper()}_REPLIES_QUEUE_URL')
-        delay_seconds = 30  # 30-second delay for message batching
-    
-    # Update the queued timestamp
-    context_object['processing']['processing_timestamps']['queued'] = datetime.utcnow().isoformat()
-    
-    # Send to the queue
-    response = sqs.send_message(
-        QueueUrl=queue_url,
-        MessageBody=json.dumps(context_object),
-        DelaySeconds=delay_seconds
-    )
-    
-    logger.info("Message sent to queue", 
-               extra={"queue": queue_url, 
-                      "message_id": response['MessageId'],
-                      "conversation_id": conversation['conversation_id']})
-```
-
-The routing logic follows a decision tree based on several critical factors:
-
-1. **Human Handoff Check**: First checks if the conversation has been flagged for human intervention
-   - If `hand_off_to_human` is true, routes to the appropriate handoff queue for human agent processing
-   - No message delay is applied to human handoff messages for immediate attention
-
-2. **Channel-Specific Queuing**: Routes to channel-specific queues using a naming convention:
-   - Uses environment variables following a predictable pattern (e.g., `WHATSAPP_REPLIES_QUEUE_URL`)
-   - This allows each channel to have dedicated processing resources and configurations
-
-3. **Message Batching**: For AI processing, applies a 30-second delay to enable message batching
-   - This delay allows multiple messages sent in quick succession to be processed together
-   - Improves context awareness for AI responses and reduces processing overhead
-   - Can be bypassed for high-priority messages if needed
-
-4. **Metadata Updates**: Records the queue timestamp in the context object for tracking
-   - Maintains a complete timeline of message processing for monitoring and auditing
-   - Enables identification of bottlenecks in the processing pipeline
-
-5. **Error Handling**: Includes proper exception handling (not shown) for queue unavailability
-   - Implements retry logic with exponential backoff for transient SQS failures
-   - Logs detailed error information for troubleshooting
-
-This routing approach ensures that messages are directed to the appropriate processing path while maintaining a complete audit trail of the message's journey through the system.
+This function performs a single DynamoDB update to add all related messages to the conversation record.
 
 ## 4. Lambda Configuration and Resources
 

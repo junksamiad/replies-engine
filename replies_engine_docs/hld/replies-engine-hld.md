@@ -106,7 +106,36 @@ This document outlines the high-level design for handling incoming user replies,
     *   Securely stores credentials for external services
     *   Referenced by credential identifiers in the context object
 
-## 3. Structured Context Object
+## 3. Single Lambda for Multi-Channel Processing
+
+To efficiently handle webhooks from multiple communication channels, the `IncomingWebhookHandler` Lambda is designed as a unified processor for all incoming webhooks:
+
+*   **Multi-Channel API Routes:**
+    *   API Gateway exposes distinct routes for each channel (/whatsapp, /sms, /email)
+    *   All routes integrate with the same Lambda function
+    *   Channel type is determined by the API path in the event object
+
+*   **Unified Processing Approach:**
+    *   Employs a parser factory pattern to handle channel-specific payload formats
+    *   Converts all webhook formats into a standardized context object
+    *   Common logic for conversation lookup, update, and queue routing is shared
+    *   Channel-specific processing is isolated in well-defined sections
+
+*   **Resource Considerations:**
+    *   Lambda sized appropriately to handle all webhook types efficiently
+    *   Memory allocation accounts for varying payload sizes across channels
+    *   Timeout configured to accommodate all expected processing paths
+    *   Monitoring in place to identify any channel-specific performance issues
+
+*   **Benefits:**
+    *   Reduced cold start latency through higher invocation frequency
+    *   Simplified deployment and maintenance of a single codebase
+    *   Consistent handling of business logic across all channels
+    *   More efficient resource utilization and cost management
+
+This approach allows for centralized processing logic while still maintaining the flexibility to handle channel-specific requirements. Only after the SQS queue do we split into channel-specific Lambdas for specialized processing needs.
+
+## 4. Structured Context Object
 
 A standardized context object flows through the system, enriched at each step:
 
@@ -151,7 +180,7 @@ A standardized context object flows through the system, enriched at each step:
 }
 ```
 
-## 4. Assumptions & Considerations
+## 5. Assumptions & Considerations
 
 *   Focus is initially on WhatsApp via Twilio, with the architecture designed to support future channels (SMS, email).
 *   Message timestamps are preserved throughout the pipeline for accurate conversation ordering.
@@ -174,7 +203,7 @@ A standardized context object flows through the system, enriched at each step:
     *   Using AWS Secrets Manager references instead of embedding credentials
     *   Leveraging serverless components that scale with demand
 
-## 5. Future Enhancements
+## 6. Future Enhancements
 
 *   Support for SMS and email channels
 *   Real-time status updates for conversations
