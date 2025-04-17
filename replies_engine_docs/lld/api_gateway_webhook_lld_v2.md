@@ -151,6 +151,10 @@ Usage plans will be implemented to protect against denial-of-service attacks and
 - Configure CloudWatch alarms to alert on high throttling events
 - Review and adjust limits based on actual usage patterns
 
+**Note on Retry Behavior:**
+- API Gateway returns `429 TooManyRequests` when rate limits are exceeded; these are **not** remapped and will be passed through to Twilio as a 429 so that Twilio will automatically retry the webhook.
+- Integration-level 4XX errors (schema/validation failures) and 5XX errors returned by the Lambda are remapped to a `200 OK` empty TwiML response (see Section 5.2.1) to prevent Twilio from retrying on those application errors.
+
 ## 4. Lambda Integration
 
 ### 4.1 Integration Type
@@ -215,6 +219,8 @@ Content-Type: application/json
 
 Unlike typical REST endpoints, Twilio webhooks expect a `200` status even on application errors, otherwise Twilio will treat it as a delivery failure. To handle errors gracefully:
 
+**Clarification:** Gateway-level throttling (429) is not affected by these mappings—only integration errors (4XX/5XX from Lambda) are remapped below.
+
 #### 5.2.1 Twilio (WhatsApp/SMS) Error Mapping
 
 - **All** `4XX` and `5XX` integration errors should be remapped to a `200` status with an empty TwiML response. This ensures Twilio will not retry or mark the webhook as failed.
@@ -264,7 +270,7 @@ Use Integration Responses without override of status code:
 
 ### 5.3 Gateway Responses for Validation Errors
 
-API Gateway can automatically return structured responses for request‐validation failures (missing headers, model mismatches):
+API Gateway can automatically return structured responses for request-validation failures (missing headers, model mismatches):
 ```yaml
 Resources:
   BadRequestBodyGatewayResponse:
