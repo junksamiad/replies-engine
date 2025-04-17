@@ -51,7 +51,7 @@ The strategy combines two key mechanisms:
 1.  **Reception & Parsing:**
     *   API Gateway triggers the Lambda upon receiving a webhook.
     *   The channel (WhatsApp, SMS, etc.) is identified from the request path.
-    *   A channel-specific parser validates the webhook's authenticity (e.g., signature check) and extracts key data (sender ID, message content, timestamp, etc.).
+    *   A channel-specific parser extracts key data from the raw event payload (sender ID, message content, timestamp, etc.) after parsing it into a dictionary.
 
 2.  **Conversation Validation:**
     *   The core validation logic queries the `ConversationsTable` using the sender ID.
@@ -67,20 +67,22 @@ The strategy combines two key mechanisms:
     *   **Concurrency Lock Detected (`status == 'processing_reply'`):** The message cannot be processed now. The `handle_concurrent_message` flow (Step 5 below) is initiated.
     *   **Success:** All checks pass, and the conversation is not locked. Proceed to queue the message.
 
-4.  **Message Queueing:**
-    *   A lightweight `message_context` is created (message details, conversation ID, company info).
-    *   **Handoff Logic:** Based on `auto_queue_reply_message` flags and sender matching in the conversation record, the message context is sent to either the **Human Handoff Queue** or the **Channel-Specific Batch Queue**.
-    *   **SQS Delay:** A `DelaySeconds` (10-20s) is applied to messages sent to the batch queue.
-    *   **SQS Attributes:** `conversation_id` is added as a message attribute.
+4.  **Routing:**
+    *   After validation, determine the routing path for the message context:
+        - Queue to a channel-specific SQS batch queue.
+        - Queue to a human handoff queue for manual processing.
+        - Handle request failure by returning an error response.
 
 5.  **Handling Concurrent Messages (When Locked):**
-    *   Triggered if Step 2 detected `status == 'processing_reply'`.
-    *   A specific fallback message is sent to the user explaining that their previous message is still being processed and asking them to wait. *(Example: "I'm processing your previous message. Please wait for my response before sending more.")*
+    *   Triggered if validation detects `status == 'processing_reply'`.
+    *   A specific fallback message is sent to the user explaining that their previous message is still being processed and asking them to wait.
     *   This fallback is sent using the appropriate channel's API (e.g., Twilio).
     *   Crucially, an HTTP 200 success response is still returned to the webhook provider.
 
-6.  **Final Acknowledgment:**
-    *   The Lambda returns an HTTP 200 success response to API Gateway (which relays it to the provider like Twilio), confirming receipt of the webhook. This happens immediately after queueing or handling the concurrent message, ensuring the provider doesn't see timeouts.
+6. **Acknowledgment:**
+    *   The Lambda returns an HTTP response based on the validation and routing outcome:
+        - **Success:** HTTP 200 with empty TwiML (or appropriate success format).
+        - **Validation or Routing Failure:** Appropriate error status or TwiML response.
 
 ### 3.2 Stage 2: BatchProcessor Lambda
 
