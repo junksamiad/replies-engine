@@ -219,29 +219,24 @@ Content-Type: application/json
 
 Unlike typical REST endpoints, Twilio webhooks expect a `200` status even on application errors, otherwise Twilio will treat it as a delivery failure. To handle errors gracefully:
 
-**Clarification:** Gateway-level throttling (429) is not affected by these mappings—only integration errors (4XX/5XX from Lambda) are remapped below.
-
 #### 5.2.1 Twilio (WhatsApp/SMS) Error Mapping
 
-- **All** `4XX` and `5XX` integration errors should be remapped to a `200` status with an empty TwiML response. This ensures Twilio will not retry or mark the webhook as failed.
+- **4XX integration errors** (application validation failures) should be remapped to a `200 OK` status with an empty TwiML response to prevent Twilio retries on persistent errors.
+- **5XX integration errors** (transient or infrastructure failures) should be passed through with their original status code so that Twilio will retry the webhook.
 
 API Gateway Method Integration Responses example (YAML snippet):
 ```yaml
+  # Map any 4xx Lambda response to 200 TwiML
   - StatusCode: 200
-    SelectionPattern: '4\d{2}'       # catch any 4xx from Lambda
+    SelectionPattern: '4\\d{2}'       # catch any 4xx from Lambda
     ResponseParameters:
       method.response.header.Content-Type: "'text/xml'"
     ResponseTemplates:
       text/xml: "<?xml version='1.0' encoding='UTF-8'?><Response></Response>"
 
-  - StatusCode: 200
-    SelectionPattern: '5\d{2}'       # catch any 5xx from Lambda
-    ResponseParameters:
-      method.response.header.Content-Type: "'text/xml'"
-    ResponseTemplates:
-      text/xml: "<?xml version='1.0' encoding='UTF-8'?><Response></Response>"
+  # Leave 5xx errors unmodified (no mapping) to allow Twilio to retry
+  # (By default, AWS_PROXY will forward the 5xx status back to the client)
 ```
-Be sure the Method Response lists status `200` under `Responses` and exposes `Content-Type`.
 
 #### 5.2.2 Email Error Mapping (Future)
 
