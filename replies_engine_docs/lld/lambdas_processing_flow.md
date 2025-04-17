@@ -8,17 +8,17 @@ The system employs a two-stage architecture to handle incoming messages efficien
 
 1.  **webhook_handler Lambda (Stage 1):** This function acts as the central, unified entry point for all webhook requests.
     *   **Receives & Parses:** Accepts webhook POST requests from various communication channels (initially WhatsApp/SMS via Twilio) forwarded by API Gateway, then parses the raw event payload (string) into a JSON object (dictionary).
-    *   **Validates:** Performs initial validation on the parsed data, including authenticity checks (Twilio signature verification) and business logic checks such as querying the `ConversationsTable` to confirm message context and conversation state.
-    *   **Routes:** Determines the appropriate next step based on validation and conversation state, queueing the message context to either an AI processing queue or a human handoff queue.
-    *   **Acknowledges:** Returns an immediate success response (e.g., HTTP 200 with TwiML) to the webhook provider (like Twilio) to confirm receipt, without waiting for downstream processing.
+    *   **Validates:** Performs initial validation on the parsed data, and queryies the `ConversationsTable` to confirm message context and conversation state.
+    *   **Routes:** Determines the appropriate next step based on validation and conversation state, queueing the message context to either a channel specific SQS queue or a human handoff SQS queue.
+    *   **Acknowledges:** Returns a response (e.g., HTTP 200 with TwiML) to the webhook provider (like Twilio) to confirm receipt or error, without waiting for downstream processing.
 
-2.  **BatchProcessor Lambda (Stage 2):** This function processes messages after a delay, handling batching and critical state management.
+X 2.  **BatchProcessor Lambda (Stage 2):** This function processes messages after a delay, handling batching and critical state management.
     *   **Receives:** Triggered by SQS messages from the batch queue after the configured delay.
     *   **Groups:** Aggregates messages received within the batch window for the same conversation.
     *   **Locks:** Implements a locking mechanism to ensure only one instance processes messages for a specific conversation at a time.
     *   **Updates:** Persists the batched user messages to the conversation record in DynamoDB.
     *   **Prepares:** Creates a comprehensive context object for further processing (e.g., AI interaction).
-    *   **Routes:** Sends the context object to the next stage (e.g., AI processing queue).
+    *   **Routes:** Sends the context object to the next stage (e.g., AI processing queue). X
 
 ## 2. Concurrency Control Design
 
@@ -33,7 +33,7 @@ This design directly addresses critical concurrency scenarios:
 
 The strategy combines two key mechanisms:
 
-1.  **Message Batching via SQS Delay:**
+X 1.  **Message Batching via SQS Delay:**
     *   Incoming messages destined for AI processing are placed onto an SQS queue configured with a `DelaySeconds` parameter (recommended: 10-20 seconds).
     *   This delay creates a "batching window," allowing messages sent in quick succession by a user to be grouped together before processing begins.
 
@@ -42,19 +42,25 @@ The strategy combines two key mechanisms:
     *   This lock is achieved by using a conditional `UpdateItem` operation to set the `conversation_status` field to `processing_reply`.
     *   The condition ensures the update only succeeds if the status is *not already* `processing_reply`.
     *   If the lock attempt fails, it means another process holds the lock, and the current batch is requeued.
-    *   The lock is released (status updated, e.g., to `ai_response_sent`) only after the entire processing cycle for that batch, including sending the reply, is complete.
+    *   The lock is released (status updated, e.g., to `ai_response_sent`) only after the entire processing cycle for that batch, including sending the reply, is complete. X
 
 ## 3. Detailed Processing Flow
 
 ### 3.1 Stage 1: IncomingWebhookHandler Lambda
 
 1.  **Reception & Parsing:**
-    *   API Gateway triggers the Lambda upon receiving a webhook.
-    *   The channel (WhatsApp, SMS, etc.) is identified from the request path.
-    *   A channel-specific parser extracts key data from the raw event payload (sender ID, message content, timestamp, etc.) after parsing it into a dictionary.
+    *   API Gateway triggers the `handler` function with an `event` dictionary.
+    *   The `handler` calls `create_context_object` (from `utils.parsing_utils`).
+    *   `create_context_object` determines the `channel_type` from `event['path']`.
+    *   It parses the `event['body']` based on the channel (e.g., form-urlencoded for Twilio) into a temporary dictionary.
+    *   It populates a `context_object` dictionary, mapping known fields (e.g., `From`, `MessageSid`) to `snake_case` keys (`from`, `message_sid`) and includes `channel_type`.
+    *   It performs basic validation (presence of essential keys) and returns the `context_object` or `None` on failure.
 
 2.  **Conversation Validation:**
-    *   The core validation logic queries the `ConversationsTable` using the sender ID.
+    *   The `handler` receives the `context_object`.
+    *   If `context_object` is `None`, the handler returns a `400 Bad Request` TwiML response.
+    *   Otherwise, the handler calls the core validation logic (e.g., `validation.validate_conversation`), passing the `context_object`.
+    *   This logic queries the `ConversationsTable` using `context_object['from']` (or equivalent sender ID field).
     *   **Checks Performed:**
         *   Does a conversation record exist?
         *   Is the associated `project_status` `active`?
