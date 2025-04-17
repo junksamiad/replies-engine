@@ -96,7 +96,7 @@ The strategy combines two key mechanisms:
 3.  **Acquire Conversation Lock:**
     *   A conditional DynamoDB `UpdateItem` attempts to set `conversation_status` to `processing_reply`.
     *   **Success:** Lock acquired. Proceed to Step 4.
-    *   **Failure (Lock Held):** The batch cannot be processed now. Trigger message requeueing logic (Section 4.1).
+    *   **Failure (Lock Held):** The batch cannot be processed now. Trigger message requeuing logic (Section 4.1).
 
 4.  **Update Conversation Record:**
     *   With the lock held, perform a DynamoDB `UpdateItem`:
@@ -193,3 +193,26 @@ sequenceDiagram
     DynamoDB-->>-Lambda2: Lock Failed (ConditionalCheckFailedException)
     Lambda2->>+SQSBatch: SendMessage (Requeue MsgX Context w/ Longer Delay & RetryAttr)
     Lambda2-->>-SQSBatch: (Message Requeued)
+```
+
+## 8. Potential Considerations
+
+### 8.1 Batching Implementation
+1. Use standard SQS queues (not FIFO) with `conversation_id` as a message attribute.
+2. Inside the BatchProcessor Lambda, group `event.Records` by `conversation_id`.
+3. Sort each group of messages by original timestamp to preserve order.
+4. Perform a single DynamoDB `UpdateItem` call per conversation batch to append messages and update timestamps.
+
+### 8.2 Lock Timeout Handling
+- If processing fails while `conversation_status` is `processing_reply`, records can remain locked indefinitely.
+- Consider adding a TTL on the `processing_started_at` timestamp or periodic check to reset stale locks.
+- Implement a scheduled Lambda (`check_and_reset_stalled_conversations`) to find and unlock conversations stuck past a threshold (e.g., 5–10 minutes).
+
+### 8.3 Handoff Queue Logic
+- Ensure the `auto_queue_reply_message` and `auto_queue_reply_message_from_number` flags are interpreted consistently across channels.
+- Confirm messages flagged for human handoff are always routed to the correct SQS handoff queue.
+
+### 8.4 Message Capacity Planning
+- Anticipate more than 10 messages arriving within the SQS delay window (batch size limit).
+- Plan for splitting or aggregating large batches to avoid Lambda timeouts or memory issues.
+- Monitor peak message volumes and adjust Lambda memory, timeout settings, and queue configurations accordingly.
