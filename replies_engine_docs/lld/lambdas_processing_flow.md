@@ -50,10 +50,29 @@ X 1.  **Message Batching via SQS Delay:**
 
 1.  **Reception & Parsing:**
     *   API Gateway triggers the `handler` function with an `event` dictionary.
+    *   **Expected Twilio Body Parameters** (in `event['body']`, form-urlencoded):
+        - `From`: Sender's phone number (e.g., `whatsapp:+1...`)
+        - `To`: Recipient's number (e.g., `whatsapp:+1...`)
+        - `Body`: The message text.
+        - `MessageSid`: Twilio's unique message identifier (e.g., `SMxxxxxxxx`).
+        - `AccountSid`: Twilio Account SID (e.g., `ACyyyyyyyy`).
+        - (Other potential fields like `NumMedia` are parsed but may not be used initially).
     *   The `handler` calls `create_context_object` (from `utils.parsing_utils`).
     *   `create_context_object` determines the `channel_type` from `event['path']`.
     *   It parses the `event['body']` based on the channel (e.g., form-urlencoded for Twilio) into a temporary dictionary.
     *   It populates a `context_object` dictionary, mapping known fields (e.g., `From`, `MessageSid`) to `snake_case` keys (`from`, `message_sid`) and includes `channel_type`.
+    *   **Example Resulting `context_object` (for Twilio WhatsApp):**
+        ```python
+        {
+            'channel_type': 'whatsapp',
+            'from': 'whatsapp:+14155238886',
+            'to': 'whatsapp:+15005550006',
+            'body': 'Hello there!',
+            'message_sid': 'SMxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+            'account_sid': 'ACyyyyyyyyyyyyyyyyyyyyyyyyyyyyy'
+            # Potentially other snake_case keys if present in body
+        }
+        ```
     *   It performs basic validation (presence of essential keys) and returns the `context_object` or `None` on failure.
 
 2.  **Conversation Validation:**
