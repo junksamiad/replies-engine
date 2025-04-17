@@ -186,17 +186,238 @@ The API Gateway requires permissions to invoke the Lambda function:
 
 ## 5. Response Handling
 
-### WhatsApp/SMS Response
+### 5.1 Success Responses
 
-A successful response to Twilio should be a minimal TwiML response:
-
+#### WhatsApp / SMS
+A successful Twilio callback should return a minimal empty TwiML envelope:
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <Response></Response>
 ```
-
-With HTTP headers:
+With HTTP status `200 OK` and header:
 ```
 Content-Type: text/xml
-Status: 200 OK
 ```
+
+#### Email
+A successful inbound email POST (future) can return a `200 OK` with an empty JSON body or confirmation JSON:
+```json
+{
+  "status": "received"
+}
+```
+With header:
+```
+Content-Type: application/json
+```
+
+### 5.2 Error Response Modeling
+
+Unlike typical REST endpoints, Twilio webhooks expect a `200` status even on application errors, otherwise Twilio will treat it as a delivery failure. To handle errors gracefully:
+
+#### 5.2.1 Twilio (WhatsApp/SMS) Error Mapping
+
+- **All** `4XX` and `5XX` integration errors should be remapped to a `200` status with an empty TwiML response. This ensures Twilio will not retry or mark the webhook as failed.
+
+API Gateway Method Integration Responses example (YAML snippet):
+```yaml
+  - StatusCode: 200
+    SelectionPattern: '4\d{2}'       # catch any 4xx from Lambda
+    ResponseParameters:
+      method.response.header.Content-Type: "'text/xml'"
+    ResponseTemplates:
+      text/xml: "<?xml version='1.0' encoding='UTF-8'?><Response></Response>"
+
+  - StatusCode: 200
+    SelectionPattern: '5\d{2}'       # catch any 5xx from Lambda
+    ResponseParameters:
+      method.response.header.Content-Type: "'text/xml'"
+    ResponseTemplates:
+      text/xml: "<?xml version='1.0' encoding='UTF-8'?><Response></Response>"
+```
+Be sure the Method Response lists status `200` under `Responses` and exposes `Content-Type`.
+
+#### 5.2.2 Email Error Mapping (Future)
+
+For email endpoints, preserve standard HTTP error codes. For example:
+- `400 Bad Request` when validation fails
+- `500 Internal Server Error` for unexpected failures
+
+Use Integration Responses without override of status code:
+```yaml
+  - StatusCode: 400
+    SelectionPattern: '4\d{2}'
+    ResponseParameters:
+      method.response.header.Content-Type: "'application/json'"
+    ResponseTemplates:
+      application/json: |
+        { "error": "Invalid email payload", "details": "$context.error.messageString" }
+
+  - StatusCode: 500
+    SelectionPattern: '5\d{2}'
+    ResponseParameters:
+      method.response.header.Content-Type: "'application/json'"
+    ResponseTemplates:
+      application/json: |
+        { "error": "Internal server error" }
+```
+
+### 5.3 Gateway Responses for Validation Errors
+
+API Gateway can automatically return structured responses for request‐validation failures (missing headers, model mismatches):
+```yaml
+Resources:
+  BadRequestBodyGatewayResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResponseType: BAD_REQUEST_BODY
+      StatusCode: 400
+      ResponseTemplates:
+        application/json: |
+          { "message": "Invalid request body: $context.error.messageString" }
+      ResponseParameters:
+        gatewayresponse.header.Content-Type: "'application/json'"
+
+  UnauthorizedGatewayResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResponseType: UNAUTHORIZED
+      StatusCode: 401
+      ResponseTemplates:
+        application/json: |
+          { "message": "Missing or invalid Twilio signature" }
+      ResponseParameters:
+        gatewayresponse.header.Content-Type: "'application/json'"
+```
+
+These GatewayResponses avoid invoking the Lambda for invalid or unauthorized requests and return clear JSON errors to clients.
+
+## 6. Monitoring and Logging
+
+### 6.1 Lambda Execution Logs (INFO / ERROR)
+- Log at **INFO** for key steps: webhook receipt, validation success/failure, queue sends, etc.
+- Log at **ERROR** for unhandled exceptions or downstream failures.
+- Use structured logging (JSON or key/value) to ease parsing in CloudWatch.
+- Configure CloudWatch Logs retention (e.g., 30 days) via LogGroup resource.
+
+### 6.2 API Gateway Access Logging
+- Enable **Access Logging** on the API stage to capture request/response metadata.
+- Example AccessLogSetting (SAM snippet):
+  ```yaml
+  AccessLogSetting:
+    DestinationArn: !GetAtt ApiGatewayAccessLogGroup.Arn
+    Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","userAgent":"$context.identity.userAgent","requestTime":"$context.requestTime","method":"$context.httpMethod","path":"$context.resourcePath","status":"$context.status","latency":"$context.integrationLatency"}'
+  ```
+- Create a dedicated LogGroup and grant `logs:PutLogEvents` to API Gateway.
+
+### 6.3 X-Ray Tracing
+- Enable **Active Tracing** on both API Gateway and the Lambda function.
+- In SAM/CloudFormation:
+  ```yaml
+  ApiGatewayStage:
+    Properties:
+      TracingEnabled: true
+  IncomingWebhookHandler:
+    Properties:
+      TracingConfig:
+        Mode: Active
+  ```
+- (Optional) Instrument your Lambda code with the X-Ray SDK to capture subsegment traces (DynamoDB, SQS).
+
+### 6.4 CloudWatch Metrics & Alarms
+- Use built-in metrics:
+  - **API Gateway**: 4XX, 5XX, Latency, IntegrationLatency, CacheHitCount.
+  - **Lambda**: Errors, Throttles, Duration, IteratorAge (for stream-based triggers).
+- Define **Metric Filters** on access logs and Lambda logs for patterns like missing signature or high retry counts.
+- Create **Alarms**:
+  - 5XX > 1% over 5-minute window
+  - Throttles > 0
+  - High IntegrationLatency (>500ms)
+  - Stalled Conversation Count (from custom metric)
+
+## 7. Deployment Strategy
+
+To provision API Gateway (and related Lambda/IAM resources) in each environment using AWS SAM:
+
+### 7.0 Prerequisites
+- AWS CLI installed & configured with access to the target AWS account
+- AWS SAM CLI installed (`sam --version`)
+- Docker running (for `--use-container` builds)
+- Git checkout on the correct branch:
+  - `develop` for deploying **dev**
+  - `main` for deploying **prod**
+
+### 7.1 CloudFormation/SAM Template
+All API Gateway resources (APIs, Resources, Methods, Models, Validators, GatewayResponses) and Lambda functions are defined in the `template.yaml` file at the project root. The template is parameterized with at least:
+
+- `EnvironmentName` (e.g. `dev` or `prod`) for resource naming and configuration
+- `LogLevel` to control runtime verbosity
+
+### 7.2 Build Process
+Build your application and dependencies in a Lambda-like container to produce deployment artifacts:
+
+```bash
+# From the project root
+sam build --use-container
+```
+- Installs dependencies inside Docker to match the Lambda runtime environment
+- Packages code and a processed `template.yaml` into the `.aws-sam/build/` directory
+
+### 7.3 Deploying with SAM CLI
+
+#### 7.3.1 Deploy to DEV
+```bash
+git checkout develop && git pull origin develop
+sam deploy \
+  --template-file .aws-sam/build/template.yaml \
+  --stack-name replies-engine-dev \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+  --resolve-s3 \
+  --parameter-overrides EnvironmentName=dev LogLevel=DEBUG
+```
+
+#### 7.3.2 Deploy to PROD
+```bash
+git checkout main && git pull origin main
+sam deploy \
+  --template-file .aws-sam/build/template.yaml \
+  --stack-name replies-engine-prod \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+  --resolve-s3 \
+  --parameter-overrides EnvironmentName=prod LogLevel=INFO
+```
+
+> **Note:** `--resolve-s3` automatically uploads built artifacts to the SAM-managed S3 deployment bucket.
+
+### 7.4 Post-Deployment Manual Steps
+Certain resources still require manual setup after stack deployment:
+- **API Keys & Usage Plans:** Create or attach API keys to the appropriate Usage Plan and Stage.
+- **Secrets Manager:** Populate environment-specific secrets (e.g. Twilio auth tokens) into AWS Secrets Manager (`/replies-engine/${EnvironmentName}/twilio`).
+- **DynamoDB Seed Data:** Insert initial company and project configuration into the `ConversationsTable` for each environment.
+- **SNS Subscriptions:** Subscribe operational endpoints to the `critical-alerts-${EnvironmentName}` SNS topic and confirm subscriptions.
+
+## 8. Testing Strategy
+
+// ... existing code ...
+
+## 8. Manual Deployment Status (AWS CLI)
+
+This section tracks the progress of manually deploying the API Gateway components described in this document using the AWS CLI.
+
+- [x] Create REST API (`ai-multi-comms-webhook-dev`)
+- [x] Create Resources (`/whatsapp`, `/sms`, `/email`)
+- [x] Create Request Model (`WhatsAppSMSWebhookModel`)
+- [x] Create Request Validator (`ValidateHeadersAndBody`)
+- [x] Configure `/whatsapp` OPTIONS Method (CORS)
+- [x] Configure `/whatsapp` POST Method (Structure Only)
+- [x] Create IAM Role for Logging (`apigateway-logs-role-ai-multi-comms-webhook-dev`)
+- [x] Ensure CloudWatch Log Group (`/aws/apigateway/ai-multi-comms-webhook-dev-access-logs`)
+- [x] Associate Logging Role with API Gateway Account Settings (`update-account`)
+- [x] Apply Resource Policy (Require `X-Twilio-Signature`)
+- [ ] Configure `/whatsapp` POST Integration (Lambda Proxy)
+- [ ] Configure `/whatsapp` POST Integration Responses (Error Mapping)
+- [ ] Create Deployment and `dev` Stage
+- [ ] Configure `dev` Stage (Access Logging, Tracing)
+- [ ] Create and Associate Usage Plan / API Key
