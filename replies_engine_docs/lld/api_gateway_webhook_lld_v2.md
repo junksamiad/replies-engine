@@ -261,26 +261,4 @@ Resources:
 2. Create request validators and models
 3. Configure usage plans and throttling
 4. Deploy and test with sample webhooks
-5. Extend to support SMS and email endpoints
-
-## 10. Potential Considerations
-
-### 10.1 Batching Implementation
-1. Use standard SQS queues (not FIFO) and include `conversation_id` as a message attribute.
-2. Within the BatchProcessor Lambda, group `event.Records` by `conversation_id`.
-3. Sort each group's messages by the original timestamp to preserve order.
-4. Process each conversation group in a single DynamoDB transaction (one `UpdateItem` per batch).
-
-### 10.2 Lock Timeout Handling
-- When processing fails while `conversation_status` is `processing_reply`, the record could remain locked.
-- Consider a timeout mechanism: use a TTL or compare a `processing_started_at` timestamp against a threshold.
-- Implement a scheduled "stalled conversation" check (e.g., every 5–10 minutes) to reset stuck records.
-
-### 10.3 Handoff Queue Logic
-- Verify the `auto_queue_reply_message` and `auto_queue_reply_message_from_number` flags consistently across all channels.
-- Ensure that messages flagged for human handoff are always routed to the correct SQS queue.
-
-### 10.4 Message Capacity Planning
-- Anticipate scenarios where more than 10 messages arrive within the batch window (SQS batch limit).
-- Plan for splitting or aggregating beyond the default SQS batch size.
-- Monitor peak volumes and adjust Lambda memory/timeouts or queue configurations as needed. 
+5. Extend to support SMS and email endpoints 
