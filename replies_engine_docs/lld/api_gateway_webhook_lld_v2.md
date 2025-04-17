@@ -37,6 +37,21 @@ Each endpoint will have its own specific request validation model and integratio
 - **Lambda Integration**: All routes will integrate with a single Lambda function with internal routing logic
 - **Initial Release**: Only the WhatsApp endpoint will be fully implemented, with placeholder resources for SMS and email
 
+### 2.3 CORS Configuration
+To support cross-origin API calls (e.g., if you ever call these endpoints from browsers or webhooks simulators):
+
+- **Allowed Origins**: `*` (or restrict to specific domains as needed)
+- **Allowed Methods**: `POST`, `OPTIONS`
+- **Allowed Headers**: `Content-Type`, `X-Twilio-Signature`, `Accept`, `User-Agent`
+- **Exposed Headers**: None (unless downstream needs to read headers like `X-Request-ID`)
+- **Allow Credentials**: `false` (not needed for webhooks)
+- **Max Age**: `3600` seconds (preflight cache duration)
+
+For each resource method:
+1.  Enable CORS in API Gateway method settings (OPTIONS method returning the above headers).
+2.  Configure Method Response to include the CORS headers in `Access-Control-Allow-*`.
+3.  Map Integration Response to pass through the CORS headers on `OPTIONS` and on `POST` success.
+
 ## 3. Security Implementation
 
 ### 3.1 Resource Policy
@@ -103,6 +118,25 @@ API Gateway request validators will be configured to ensure incoming webhooks ma
 - Configure validators in API Gateway for each endpoint
 - Requests not meeting the schema will be rejected with 400 Bad Request
 
+### 3.2.1 Example JSON Schema Model
+Below is an example of an `AWS::ApiGateway::Model` JSON schema for validating a WhatsApp/SMS webhook payload (for `application/x-www-form-urlencoded` after mapping to JSON):
+```json
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "title": "WhatsApp/SMS Webhook Request",
+  "type": "object",
+  "properties": {
+    "From":      { "type": "string" },
+    "To":        { "type": "string" },
+    "Body":      { "type": "string" },
+    "AccountSid":{ "type": "string" },
+    "MessageSid":{ "type": "string" }
+  },
+  "required": ["From", "To", "Body", "AccountSid", "MessageSid"]
+}
+```
+This model is then referenced by a **Request Validator** on the `/whatsapp` and `/sms` POST methods to enforce that only well-formed requests reach the Lambda.
+
 ### 3.3 Throttling and Quotas
 
 Usage plans will be implemented to protect against denial-of-service attacks and excessive usage.
@@ -166,99 +200,3 @@ With HTTP headers:
 Content-Type: text/xml
 Status: 200 OK
 ```
-
-### Email Response (TBD)
-
-Appropriate response format based on email provider requirements.
-
-## 6. Monitoring and Logging
-
-### CloudWatch Logging
-
-- **Log Level**: INFO for normal operations, ERROR for failures
-- **Access Logging**: Enable API Gateway access logging
-- **Execution Logging**: Configure logging for all API stages
-
-### CloudWatch Metrics
-
-- **Standard Metrics**:
-  - IntegrationLatency - Time between when API Gateway relays a request to the backend and when it receives a response
-  - Latency - Time between when API Gateway receives a request from a client and when it returns a response
-  - CacheHitCount/CacheMissCount - Not applicable (no caching enabled)
-  - Count - Total number of API requests in a given period
-
-### Alerting
-
-- Set up alarms for:
-  - High 4XX or 5XX error rates
-  - Elevated latency
-  - Throttling events
-  - Quota limit approaching
-
-## 7. Deployment Strategy
-
-### CloudFormation/SAM Template
-
-The API Gateway and associated resources will be defined in infrastructure-as-code:
-
-```yaml
-# Simplified example
-Resources:
-  ApiGateway:
-    Type: AWS::ApiGateway::RestApi
-    Properties:
-      Name: replies-engine-webhook-api
-      Description: "Webhook endpoints for replies-engine"
-  
-  UsagePlan:
-    Type: AWS::ApiGateway::UsagePlan
-    Properties:
-      ApiStages:
-        - ApiId: !Ref ApiGateway
-          Stage: !Ref ApiStage
-      Throttle:
-        RateLimit: 10
-        BurstLimit: 20
-      Quota:
-        Limit: 50000
-        Period: MONTH
-
-  WhatsAppResource:
-    Type: AWS::ApiGateway::Resource
-    Properties:
-      RestApiId: !Ref ApiGateway
-      ParentId: !GetAtt ApiGateway.RootResourceId
-      PathPart: "whatsapp"
-      
-  # Additional resources for SMS and Email routes
-  # Request validators, models, methods, etc.
-```
-
-### Multi-Environment Support
-
-- Use CloudFormation parameters to customize for different environments
-- Incorporate environment-specific naming conventions
-- Deploy separate stacks for dev, staging, and production
-
-## 8. Testing Strategy
-
-### API Gateway Testing
-
-- Use API Gateway Test feature to send test requests
-- Verify request validation and models
-- Test throttling behavior
-- Validate CORS configuration
-
-### End-to-End Testing
-
-- Send webhook requests from Twilio test accounts
-- Verify integration with Lambda and backend systems
-- Test error handling and response formatting
-
-## 9. Next Steps
-
-1. Implement the API Gateway with WhatsApp endpoint and security measures
-2. Create request validators and models
-3. Configure usage plans and throttling
-4. Deploy and test with sample webhooks
-5. Extend to support SMS and email endpoints 
