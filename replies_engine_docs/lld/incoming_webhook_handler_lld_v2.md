@@ -275,3 +275,51 @@ These measures ensure idempotent processing even if Twilio retries the webhook o
   * Throttles > 0
   * IteratorAge > configured SQS visibility timeout
   * High message requeue count (indicates contention or failures)
+
+## 11. Deployment
+
+When deploying both the IncomingWebhookHandler and BatchProcessor Lambdas, follow the same SAM CLI workflow used for the API Gateway:
+
+### 11.1 Prerequisites
+- AWS CLI configured with the target account credentials
+- AWS SAM CLI installed (`sam --version`)
+- Docker running (required for `--use-container` builds)
+- Git branch checkout:
+  - `develop` for **dev** deployments
+  - `main` for **prod** deployments
+
+### 11.2 Build (Containerized)
+Run at the project root to package your Lambda code and dependencies:
+```bash
+sam build --use-container
+```
+Artifacts and the processed `template.yaml` are output to `.aws-sam/build/`.
+
+### 11.3 Deploying with SAM CLI
+
+#### Deploy to DEV
+```bash
+git checkout develop && git pull origin develop
+sam deploy \
+  --template-file .aws-sam/build/template.yaml \
+  --stack-name replies-engine-dev \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+  --resolve-s3 \
+  --parameter-overrides EnvironmentName=dev LogLevel=DEBUG
+```
+
+#### Deploy to PROD
+```bash
+git checkout main && git pull origin main
+sam deploy \
+  --template-file .aws-sam/build/template.yaml \
+  --stack-name replies-engine-prod \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+  --resolve-s3 \
+  --parameter-overrides EnvironmentName=prod LogLevel=INFO
+```
+
+### 11.4 Post-Deployment Manual Steps
+- Populate AWS Secrets Manager with Twilio credentials under `/replies-engine/${EnvironmentName}/twilio`.
+- Associate any required environment variables or config in the deployed Lambda via the SAM parameters.
+- Validate that the `IncomingWebhookHandler` Lambda has the correct AWS IAM role permissions (DynamoDB, SQS, Secrets Manager, CloudWatch).
