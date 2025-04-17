@@ -1,7 +1,6 @@
 # webhook_handler/index.py
 
 import json
-import re
 from urllib.parse import parse_qs
 
 # Placeholder for future modular functions
@@ -9,13 +8,8 @@ from urllib.parse import parse_qs
 # from .services import queue_service
 # from .utils import parsing_utils
 
-def _to_snake_case(name):
-    """Converts CamelCase or PascalCase to snake_case."""
-    s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
-    return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
-
 def create_context_object(event):
-    """Parses event, extracts data, converts keys to snake_case, builds context dict. Returns None on failure."""
+    """Parses event, extracts data, maps known keys to snake_case, builds context dict. Returns None on failure."""
     context_object = {}
     request_path = event.get('path', '')
 
@@ -55,10 +49,21 @@ def create_context_object(event):
                  return None
     # ... Add more channel parsing logic ...
 
-    # Populate context object with snake_case keys
-    for key, value in parsed_body.items():
-        snake_key = _to_snake_case(key)
-        context_object[snake_key] = value
+    # Populate context object with snake_case keys (hardcoded for known fields)
+    if context_object['channel_type'] in ['whatsapp', 'sms']:
+        context_object['from'] = parsed_body.get('From')
+        context_object['to'] = parsed_body.get('To')
+        context_object['body'] = parsed_body.get('Body')
+        context_object['message_sid'] = parsed_body.get('MessageSid')
+        context_object['account_sid'] = parsed_body.get('AccountSid')
+        # Add any other known Twilio fields here if needed
+    elif context_object['channel_type'] == 'email':
+        # Assuming email parser provides snake_case keys directly
+        context_object['from_address'] = parsed_body.get('from_address')
+        context_object['to_address'] = parsed_body.get('to_address')
+        context_object['email_body'] = parsed_body.get('email_body')
+        context_object['email_id'] = parsed_body.get('email_id')
+    # ... Add more channel mappings ...
 
     # Basic validation of essential snake_case fields
     # Adjust required fields based on expected snake_case keys
