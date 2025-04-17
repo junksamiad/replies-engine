@@ -216,3 +216,62 @@ sequenceDiagram
 - Anticipate more than 10 messages arriving within the SQS delay window (batch size limit).
 - Plan for splitting or aggregating large batches to avoid Lambda timeouts or memory issues.
 - Monitor peak message volumes and adjust Lambda memory, timeout settings, and queue configurations accordingly.
+
+## 9. Idempotency and Deduplication
+To prevent processing the same message twice (e.g., due to Lambda timeouts or Twilio retries), implement the following strategies:
+
+1. Use the Twilio `MessageSid` as a deduplication key in each message context.
+2. **Consumer-side check**: In the BatchProcessor Lambda (or in the DynamoDB update logic), verify whether `MessageSid` already exists in the conversation's `messages` list before appending:
+   - Query the conversation record for existing message IDs.
+   - If `MessageSid` is found, skip processing this message and log a `DuplicateMessageDetected` event.
+3. **Conditional DynamoDB write**: Use a conditional update expression to append only if no existing item has the same `MessageSid`, e.g.:  
+   ```python
+   table.update_item(
+     Key={'conversation_id': conv_id},
+     UpdateExpression="SET messages = list_append(if_not_exists(messages, :empty), :new_messages)",
+     ConditionExpression="attribute_not_exists(messages[?].message_id)",  # pseudo-code
+     ExpressionAttributeValues={':new_messages': new_messages, ':empty': []}
+   )
+   ```
+4. **Optional FIFO Queue**: Switch the batch SQS queue to FIFO and set `MessageDeduplicationId` to `MessageSid`. SQS will automatically drop duplicates within a 5-minute window.
+
+These measures ensure idempotent processing even if Twilio retries the webhook or a Lambda invocation times out after enqueuing a message.
+
+## 10. Monitoring and Logging
+
+### 10.1 Lambda Execution Logs (INFO / ERROR)
+- Log at **INFO** level for key events in both Lambdas:
+  * Incoming webhook received and parsed
+  * Validation outcome (success or business-rule failure)
+  * Message queued to SQS or fallback sent
+  * Batch processing start and completion
+- Log at **ERROR** level for unexpected exceptions or downstream failures (DynamoDB, SQS errors).
+- Use structured logging (JSON or key/value pairs) to simplify searching in CloudWatch Logs.
+- Configure LogGroup retention (e.g., 30 days) for both functions in your SAM/CloudFormation.
+
+### 10.2 X-Ray Tracing
+- Enable **Active Tracing** on both Lambdas to correlate end-to-end traces:
+  ```yaml
+  IncomingWebhookHandler:
+    Properties:
+      TracingConfig:
+        Mode: Active
+  BatchProcessorLambda:
+    Properties:
+      TracingConfig:
+        Mode: Active
+  ```
+- (Optional) Instrument code with the AWS X-Ray SDK to capture DynamoDB/SQS subsegments.
+
+### 10.3 CloudWatch Metrics & Alarms
+- Leverage built-in Lambda metrics:
+  * **Errors**: count of function errors
+  * **Duration**: execution time
+  * **Throttles**: if concurrency limits are hit
+  * **IteratorAge** (for BatchProcessor SQS trigger) shows message delay in the queue
+- Define **Metric Filters** on Lambda logs for custom events (e.g. `DuplicateMessageDetected`, `LockContention`).
+- Create **Alarms** for critical conditions:
+  * Lambda Errors > 1% of invocations over 5 minutes
+  * Throttles > 0
+  * IteratorAge > configured SQS visibility timeout
+  * High message requeue count (indicates contention or failures)
