@@ -153,7 +153,7 @@ Usage plans will be implemented to protect against denial-of-service attacks and
 
 **Note on Retry Behavior:**
 - API Gateway returns `429 TooManyRequests` when rate limits are exceeded; these are **not** remapped and will be passed through to Twilio as a 429 so that Twilio will automatically retry the webhook.
-- Integration-level 4XX errors (schema/validation failures) and 5XX errors returned by the Lambda are remapped to a `200 OK` empty TwiML response (see Section 5.2.1) to prevent Twilio from retrying on those application errors.
+- Integration-level 4XX errors (schema/validation failures) errors returned by the Lambda are remapped to a `200 OK` empty TwiML response (see Section 5.2.1) to prevent Twilio from retrying on those application errors.
 
 ## 4. Lambda Integration
 
@@ -221,24 +221,51 @@ Unlike typical REST endpoints, Twilio webhooks expect a `200` status even on app
 
 #### 5.2.1 Twilio (WhatsApp/SMS) Error Mapping
 
-- **4XX integration errors** (application validation failures) should be remapped to a `200 OK` status with an empty TwiML response to prevent Twilio retries on persistent errors.
-- **5XX integration errors** (transient or infrastructure failures) should be passed through with their original status code so that Twilio will retry the webhook.
+- **Goal:** Ensure Twilio retries only for transient infrastructure/server errors (typically 5xx) and *not* for non-transient validation/application errors (typically 4xx) or unexpected code bugs.
+- 
+- **Implementation via Lambda:** The primary logic for this resides within the `webhook_handler` Lambda function itself:
+    - **Non-Transient Errors (4xx or unexpected 5xx):** When the Lambda detects a non-transient error (e.g., parsing failure, `CONVERSATION_NOT_FOUND`, `PROJECT_INACTIVE`, an unexpected code bug), it **directly returns a 200 OK response with empty TwiML** to API Gateway. This immediately signals success to Twilio and prevents retries.
+    - **Known Transient Errors (expected 5xx):** When the Lambda detects a known transient error (e.g., `DB_TRANSIENT_ERROR`), it **intentionally raises an Exception**. 
+-
+- - **4XX integration errors** (application validation failures) should be remapped to a `200 OK` status with an empty TwiML response to prevent Twilio retries on persistent errors.
+- - **5XX integration errors** (transient or infrastructure failures) should be passed through with their original status code so that Twilio will retry the webhook.
+  
+- API Gateway Method Integration Responses example (YAML snippet):
++ **API Gateway Integration Response Configuration:** To complete the transient error handling, the API Gateway Integration Response for the `POST` method needs to be configured:
+    - It must map Lambda execution errors (specifically those matching the exceptions raised by the Lambda for transient errors) to an appropriate **HTTP 5xx status code** (e.g., 500 or 503). This ensures Twilio receives a non-200 status and initiates a retry only for these intended transient failures.
+    - The default `AWS_PROXY` behavior often maps unhandled Lambda exceptions to 500/502, which satisfies the retry requirement, but explicit mapping based on error patterns (e.g., `errorMessage` containing "Transient server error:") provides more control.
+    - **Note:** There is no need for an Integration Response mapping to handle the 4xx errors, as the Lambda returns 200 OK directly in those cases.
 
-API Gateway Method Integration Responses example (YAML snippet):
-```yaml
-  # Map any 4xx Lambda response to 200 TwiML
-  - StatusCode: 200
-    SelectionPattern: '4\\d{2}'       # catch any 4xx from Lambda
-    ResponseParameters:
-      method.response.header.Content-Type: "'text/xml'"
-    ResponseTemplates:
-      text/xml: "<?xml version='1.0' encoding='UTF-8'?><Response></Response>"
-
-  # Leave 5xx errors unmodified (no mapping) to allow Twilio to retry
-  # (By default, AWS_PROXY will forward the 5xx status back to the client)
-```
-
-#### 5.2.2 Email Error Mapping (Future)
++- **Example Integration Response Snippet (Conceptual - requires Lambda integration):**
+ ```yaml
++  IntegrationResponses:
++    # Default response for successful Lambda execution (which includes the 200 OK TwiML cases)
++    - StatusCode: 200 
++      # No SelectionPattern needed for default
++    # Map Lambda Execution Errors matching our transient pattern to 503 Service Unavailable
++    - StatusCode: 503
++      SelectionPattern: '.*Transient server error:.*' # Matches exception message raised by Lambda
++      # No ResponseTemplates needed - API Gateway generates default body for 5xx
++    # Catch-all for other Lambda Execution Errors (e.g., timeouts, other unhandled exceptions)
++    # Map to 500 Internal Server Error
++    - StatusCode: 500
++      SelectionPattern: '.*' # Default catch-all if other patterns don't match
++    # Default Success: Ensure the default integration response passes through the 200 OK TwiML returned by the Lambda for successful processing or non-transient errors.
+ ```
+- ```yaml
+-   # Map any 4xx Lambda response to 200 TwiML
+-   - StatusCode: 200
+-     SelectionPattern: '4\\d{2}'       # catch any 4xx from Lambda
+-     ResponseParameters:
+-       method.response.header.Content-Type: "'text/xml'"
+-     ResponseTemplates:
+-       text/xml: "<?xml version='1.0' encoding='UTF-8'?><Response></Response>"
+-
+-   # Leave 5xx errors unmodified (no mapping) to allow Twilio to retry
+-   # (By default, AWS_PROXY will forward the 5xx status back to the client)
+- ```
+ 
+ #### 5.2.2 Email Error Mapping (Future)
 
 For email endpoints, preserve standard HTTP error codes. For example:
 - `400 Bad Request` when validation fails
@@ -419,6 +446,11 @@ This section tracks the progress of manually deploying the API Gateway component
 - [x] Apply Resource Policy (Require `X-Twilio-Signature`)
 - [ ] Configure `/whatsapp` POST Integration (Lambda Proxy)
 - [ ] Configure `/whatsapp` POST Integration Responses (Error Mapping)
+- [ ] Configure /whatsapp POST Integration Responses (Error Mapping)
+    - **Goal:** Ensure Twilio retries *only* on transient errors (DB unavailable, etc.) and *not* on validation/application errors. See Section 5.2.1 for details.
+    - **Required Mapping:** Configure mappings to translate specific Lambda execution errors (Exceptions raised for transient codes like `DB_TRANSIENT_ERROR`) into appropriate HTTP 5xx status codes (e.g., 503 or 500).
+    - **Error Pattern:** Use `SelectionPattern` based on the Lambda exception message (e.g., matching `.*Transient server error:.*`).
+    - **Default Success:** Ensure the default integration response passes through the 200 OK TwiML returned by the Lambda for successful processing or non-transient errors.
 - [ ] Create Deployment and `dev` Stage
 - [ ] Configure `dev` Stage (Access Logging, Tracing)
 - [ ] Create and Associate Usage Plan / API Key

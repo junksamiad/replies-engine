@@ -1,174 +1,144 @@
 # webhook_handler/index.py
 
 import json
-from urllib.parse import parse_qs
+import logging # Import logging
+# Removed urllib.parse import as it's now in parsing_utils
 
 # Placeholder for future modular functions
 # from .core import validation_logic
 # from .services import queue_service
 # from .utils import parsing_utils
 
-def create_context_object(event):
-    """Parses event, extracts data, maps known keys to snake_case, builds context dict. Returns None on failure."""
-    context_object = {}
-    request_path = event.get('path', '')
+from .utils.parsing_utils import create_context_object
+from .core import validation
+from .services import sqs_service # Placeholder
+from .utils import response_builder
 
-    # Determine channel
-    if request_path == '/whatsapp':
-        context_object['channel_type'] = 'whatsapp'
-    elif request_path == '/sms':
-        context_object['channel_type'] = 'sms'
-    elif request_path == '/email': # Assuming email path for now
-        context_object['channel_type'] = 'email'
-    else:
-        print(f"ERROR: Unknown request path {request_path}")
-        return None
+# Define logger for handler exceptions
+logger = logging.getLogger()
+logger.setLevel(logging.INFO) # Or DEBUG
 
-    # Parse body
-    raw_body = event.get('body', '')
-    parsed_body = {}
-    if context_object['channel_type'] in ['whatsapp', 'sms']:
-        if not raw_body:
-            print("ERROR: Missing body for WhatsApp/SMS")
-            return None
-        try:
-            parsed_qs_dict = parse_qs(raw_body)
-            parsed_body = {k: v[0] for k, v in parsed_qs_dict.items()}
-        except Exception as e:
-            print(f"ERROR parsing form-urlencoded body: {e}")
-            return None
-    elif context_object['channel_type'] == 'email':
-        if not raw_body:
-             print("WARN: Missing body for Email")
-             parsed_body = {}
+# Define error codes that should trigger retries for Twilio (by raising Exception)
+TRANSIENT_ERROR_CODES = {
+    'DB_TRANSIENT_ERROR',
+    # Add 'QUEUE_TRANSIENT_ERROR' here when implemented
+}
+
+def _determine_final_error_response(context_object, error_code, error_message):
+    """
+    Determines the final HTTP response based on channel and error code.
+    Applies Twilio-specific logic: 
+    - Raises Exception ONLY for known TRANSIENT_ERROR_CODES to allow retry.
+    - Returns 200 OK TwiML for ALL OTHER errors to prevent retry.
+    """
+    # Log the underlying error details
+    print(f"Handling error: Code='{error_code}', Message='{error_message}'")
+    
+    # Get the standard response suggestion (mainly for status code mapping)
+    # We might not use the full response directly for Twilio non-transient
+    suggested_response = response_builder.create_error_response(error_code, error_message)
+    
+    # Ensure channel_type is available, default to 'unknown' if context is partial/missing
+    channel_type = context_object.get('channel_type', 'unknown') if context_object else 'unknown'
+
+    if channel_type in ['whatsapp', 'sms']:
+        # Handle Twilio: Raise Exception for transient, return 200 TwiML otherwise
+        if error_code in TRANSIENT_ERROR_CODES:
+            print(f"Raising exception for transient error '{error_code}' for API GW mapping.")
+            # Raise exception to allow API Gateway's Integration Response to map to 5xx
+            raise Exception(f"Transient server error: {error_code} - {error_message}")
         else:
-            try:
-                 parsed_body = json.loads(raw_body)
-            except json.JSONDecodeError as e:
-                 print(f"ERROR parsing email JSON body: {e}")
-                 return None
-    # ... Add more channel parsing logic ...
-
-    # Populate context object with snake_case keys (hardcoded for known fields)
-    if context_object['channel_type'] in ['whatsapp', 'sms']:
-        context_object['from'] = parsed_body.get('From')
-        context_object['to'] = parsed_body.get('To')
-        context_object['body'] = parsed_body.get('Body')
-        context_object['message_sid'] = parsed_body.get('MessageSid')
-        context_object['account_sid'] = parsed_body.get('AccountSid')
-        # Add any other known Twilio fields here if needed
-    elif context_object['channel_type'] == 'email':
-        # Assuming email parser provides snake_case keys directly
-        context_object['from_address'] = parsed_body.get('from_address')
-        context_object['to_address'] = parsed_body.get('to_address')
-        context_object['email_body'] = parsed_body.get('email_body')
-        context_object['email_id'] = parsed_body.get('email_id')
-    # ... Add more channel mappings ...
-
-    # Basic validation of essential snake_case fields
-    # Adjust required fields based on expected snake_case keys
-    if context_object['channel_type'] in ['whatsapp', 'sms']:
-         required_keys = ['from', 'to', 'body', 'message_sid', 'account_sid']
-    elif context_object['channel_type'] == 'email':
-         # Adjust for expected snake_case email keys if different
-         required_keys = ['from_address', 'to_address', 'email_body', 'email_id'] # Assuming these are already snake_case
+            # For ALL other non-transient errors (4xx or unexpected 5xx), return 200 TwiML
+            print(f"Mapping non-transient error '{error_code}' to 200 TwiML for Twilio.")
+            return response_builder.create_success_response_twiml()
     else:
-         required_keys = [] # Should not happen if channel type determined earlier
-
-    if not all(context_object.get(k) for k in required_keys):
-         print(f"ERROR: Missing essential fields after parsing: {context_object}")
-         # Consider logging which specific keys are missing
-         return None
-
-    print(f"Successfully created context_object: {context_object}")
-    return context_object
+        # Handle other channels (e.g., email): return standard error response
+        print(f"Returning standard error response for channel {channel_type} - {error_code}")
+        return suggested_response
 
 def handler(event, context):
     """Main Lambda handler function."""
     print(f"Received event: {json.dumps(event)}")
+    context_object = None # Initialize context_object
+    try:
+        context_object = create_context_object(event)
 
-    context_object = create_context_object(event)
+        if context_object is None:
+            print("Failed to create valid context object.")
+            path = event.get('path', '')
+            temp_context_for_response = {'channel_type': 'whatsapp' if path == '/whatsapp' else 'sms' if path == '/sms' else 'email' if path == '/email' else 'unknown'}
+            # PARSING_ERROR is non-transient
+            return _determine_final_error_response(
+                temp_context_for_response, 
+                'PARSING_ERROR', 
+                "Failed to parse incoming request or create context."
+            )
 
-    if context_object is None:
-        print("Failed to create valid context object. Returning error response.")
-        # Return generic TwiML error for now
-        return {
-            'statusCode': 400,
-            'headers': {'Content-Type': 'text/xml'},
-            'body': '<?xml version="1.0" encoding="UTF-8"?><Response><Message>Failed to process request.</Message></Response>'
-        }
+        # --- Core Validation Steps --- 
+        existence_check = validation.check_conversation_exists(context_object)
+        
+        if not existence_check['valid']:
+            error_code = existence_check.get('error_code', 'INTERNAL_ERROR')
+            error_message = existence_check.get('message', 'Unknown validation error')
+            return _determine_final_error_response(context_object, error_code, error_message)
+        
+        context_object = existence_check['data']
 
-    # --- Placeholder for further processing --- 
-    # 1. Core Validation (DynamoDB checks etc.) using context_object
-    #    validation_result = validation_logic.validate_conversation(context_object)
-    #    if not validation_result['valid']:
-    #        # Handle validation failure, return appropriate TwiML/error
-    #        return validation_result['response']
+        # --- Further Validation Placeholder ---
+        # further_validation_result = validation.validate_further(context_object)
+        # if not further_validation_result['valid']:
+        #    error_code = further_validation_result.get('error_code', 'VALIDATION_FAILED')
+        #    error_message = further_validation_result.get('message', 'Further validation failed')
+        #    return _determine_final_error_response(context_object, error_code, error_message)
+        # context_object = further_validation_result['data']
 
-    # 2. Routing Logic
-    #    queue_url = routing_logic.determine_queue(context_object)
+        # --- Routing/Queueing Placeholder ---
+        # try:
+        #    queue_url = validation.determine_routing(context_object)
+        #    sqs_service.send_message(queue_url, context_object)
+        # except Exception as e:
+        #    print(f"ERROR during routing/queueing: {e}")
+        #    # Determine if QUEUE_ERROR is transient or not
+        #    return _determine_final_error_response(context_object, 'QUEUE_ERROR', f"Failed process message routing or queueing: {e}")
 
-    # 3. Send to SQS (using services module)
-    #    try:
-    #        queue_service.send_to_sqs(queue_url, context_object)
-    #    except Exception as e:
-    #        # Handle queueing failure, return 5xx error
-    #        print(f"ERROR queueing message: {e}")
-    #        # Return error (important: decide if 500 or 200 TwiML)
-    #        # For now, return success TwiML to prevent Twilio retries on queue fail
-    #        return {
-    #            'statusCode': 200, 
-    #            'headers': {'Content-Type': 'text/xml'},
-    #            'body': '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
-    #        }
+        # --- Acknowledge Success --- 
+        print("Processing successful. Sending success acknowledgment.")
+        if context_object['channel_type'] in ['whatsapp', 'sms']:
+            return response_builder.create_success_response_twiml()
+        else:
+            return response_builder.create_success_response_json(message=f"{context_object['channel_type'].capitalize()} received")
 
-    # 4. Acknowledge Success (Default for Twilio)
-    print("Processing steps completed (placeholders). Sending success acknowledgment.")
-    if context_object['channel_type'] in ['whatsapp', 'sms']:
-        return {
-            'statusCode': 200,
-            'headers': {'Content-Type': 'text/xml'},
-            'body': '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
-        }
-    else: # Example for email
-         return {
-            'statusCode': 200,
-            'headers': {'Content-Type': 'application/json'},
-            'body': json.dumps({'status': 'received'})
-         }
+    except Exception as e:
+        # General exception handler for unexpected errors 
+        # (INCLUDING transient ones intentionally raised by _determine_final_error_response)
+        print(f"FATAL ERROR in handler: {e}")
+        logger.exception("Unhandled exception caught in webhook handler") # Log full stack trace
+        
+        # Check if the exception message indicates it was an intentionally raised transient error
+        # This helps differentiate between expected transient failures and actual code bugs
+        if "Transient server error:" in str(e):
+            # Re-raise the specific exception to let API Gateway handle it as 5xx
+            # This ensures Twilio retries ONLY for these known transient cases
+            raise e 
+        else:
+            # This is likely an unexpected code bug or unhandled scenario
+            # Determine channel type for response if possible
+            channel_type = context_object.get('channel_type', 'unknown') if context_object else 'unknown'
+            if not channel_type or channel_type == 'unknown':
+                 path = event.get('path', '')
+                 channel_type = 'whatsapp' if path == '/whatsapp' else 'sms' if path == '/sms' else 'email' if path == '/email' else 'unknown'
 
-# Example usage (for local testing)
-if __name__ == '__main__':
-    # Example Twilio event
-    example_event_twilio = {
-        "path": "/whatsapp",
-        "httpMethod": "POST",
-        "headers": {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "X-Twilio-Signature": "test_sig"
-        },
-        "queryStringParameters": None,
-        "pathParameters": None,
-        "requestContext": {},
-        "body": "From=whatsapp%3A%2B14155238886&To=whatsapp%3A%2B15005550006&Body=Hello+there%21&MessageSid=SMxxxxxxxxxxxxxxxxxxxxxxxxxxxxx&AccountSid=ACyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
-        "isBase64Encoded": False
-    }
-    response = handler(example_event_twilio, None)
-    print(f"\nHandler Response:\n{json.dumps(response, indent=2)}")
+            if channel_type in ['whatsapp', 'sms']:
+                # Safety net: Return 200 TwiML for unexpected errors to prevent Twilio retries
+                print("Caught unexpected exception, returning 200 TwiML to Twilio to prevent retries on code error.")
+                return response_builder.create_success_response_twiml()
+            else:
+                # For other channels, return a standard 500 error
+                return response_builder.create_error_response('INTERNAL_ERROR', 'An unexpected server error occurred', 500)
 
-    # Example Email event (hypothetical JSON body)
-    example_event_email = {
-        "path": "/email",
-        "httpMethod": "POST",
-        "headers": {
-            "Content-Type": "application/json"
-        },
-        "body": json.dumps({
-            "from_address": "sender@example.com", # Already snake_case
-            "to_address": "receiver@example.com", # Already snake_case
-            "email_body": "This is the email content.", # Already snake_case
-            "email_id": "email_zzzzzzzzzzzzzzzz" # Already snake_case
-        })
-    }
-    response_email = handler(example_event_email, None)
-    print(f"\nEmail Handler Response:\n{json.dumps(response_email, indent=2)}") 
+# Commented out __main__ block for clarity - use pytest for testing
+# if __name__ == '__main__':
+#     # ... (example event data can be moved to test files) ...
+#     pass
+
+# Removed example usage block as testing should be separate 

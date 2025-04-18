@@ -157,6 +157,22 @@ X 1.  **Message Batching via SQS Delay:**
     *   It scans DynamoDB for conversations stuck in `processing_reply` state for longer than a defined threshold (e.g., 5 minutes, longer than max expected processing time).
     *   It resets the status of stalled conversations to a distinct state like `processing_timeout` and logs a warning for investigation. This prevents permanent locks.
 
+### 4.3 Handler Error Response Logic (Stage 1 - `webhook_handler`)
+
+The `webhook_handler` Lambda implements specific logic to handle errors detected during parsing or validation, ensuring correct retry behavior for webhook providers like Twilio.
+
+1.  **Internal Error Reporting:** Functions within the Lambda's modules (e.g., `core/validation.py`) detect specific errors (e.g., conversation not found, transient DB issue) and return a standard dictionary indicating failure, including an `error_code` (e.g., `CONVERSATION_NOT_FOUND`, `DB_TRANSIENT_ERROR`) and a descriptive `message`.
+2.  **Response Builder Suggestion:** The main `handler` function receives this error information. It uses a utility (`utils/response_builder.py`) to translate the `error_code` into a *suggested*, standard HTTP response structure. This builder contains a mapping from internal error codes to default HTTP status codes (e.g., `CONVERSATION_NOT_FOUND` -> 404, `DB_TRANSIENT_ERROR` -> 503) and formats a standard JSON error body.
+3.  **Final Response Determination (Handler Logic):** The `handler` then applies channel-specific logic:
+    *   **For Twilio Channels (`whatsapp`, `sms`):**
+        *   If the error code represents a **known transient error** (e.g., `DB_TRANSIENT_ERROR`, defined in `TRANSIENT_ERROR_CODES`), the handler **raises an Exception**. This causes the Lambda execution to fail, signaling API Gateway to return a 5xx response (based on Integration Response mapping), which triggers a **Twilio retry**.
+        *   If the error code represents **any other non-transient error** (including parsing failures, validation errors like `CONVERSATION_NOT_FOUND`, or unexpected internal 5xx errors), the handler **returns a 200 OK response with empty TwiML**. This prevents Twilio from retrying on errors that won't resolve themselves.
+        *   A final `try...except` block in the handler acts as a safety net, catching unexpected code bugs and returning 200 OK TwiML to prevent retries on these unforeseen issues.
+    *   **For Other Channels (e.g., `email`):**
+        *   The handler generally returns the standard error response (e.g., 4xx or 5xx JSON) suggested by the `response_builder`.
+
+This approach ensures that only explicitly identified transient infrastructure issues trigger webhook retries from providers like Twilio, while validation failures and unexpected errors are acknowledged without causing unnecessary retries.
+
 ## 5. Concurrency Considerations and Recommendations
 
 *   **Batch Window (SQS Delay):** 10-20 seconds is a reasonable starting point. Monitor user behavior and adjust. Shorter means faster response for single messages; longer improves batching potential for rapid-fire messages but delays the initial response.
