@@ -60,6 +60,20 @@ X 1.  **Message Batching via SQS Delay:**
     *   This function determines the `channel_type` from `event['path']`.
     *   It parses the `event['body']` based on the channel.
     *   It populates and returns a `context_object` dictionary with `snake_case` keys (or `None` on failure).
+    *   **Flow Diagram:**
+        ```mermaid
+        graph TD
+            A[API Gateway Event] --> B(handler function);
+            B --> C{Call create_context_object};
+            C --> D{Determine Channel from Path};
+            D --> E{Parse Body based on Channel};
+            E --> F{Populate context_object w/ snake_case keys};
+            F --> G{Basic Key Validation};
+            G -- OK --> H(Return context_object);
+            G -- Fail --> I(Return None);
+            H --> B;
+            I --> B;
+        ```
     *   **Example Resulting `context_object` (for Twilio WhatsApp):**
         ```python
         {
@@ -76,6 +90,33 @@ X 1.  **Message Batching via SQS Delay:**
     *   The `handler` checks if `context_object` is `None`. If so, signals `'PARSING_ERROR'` (Step 6).
     *   The `handler` calls `core.validation.check_conversation_exists(context_object)`.
     *   This function queries the appropriate GSI in the `ConversationsTable` using keys derived from the context (e.g., `gsi_company_whatsapp_number`, `gsi_recipient_tel`) and filters for `task_complete = 0`.
+    *   **Flow Diagram:**
+        ```mermaid
+        graph TD
+            A[handler w/ context_object] --> B(Call check_conversation_exists);
+            B --> C{Get GSI Config};
+            C -- Fail --> X[Return CONFIGURATION_ERROR];
+            C -- OK --> D{Prepare GSI Keys (Strip Prefixes)};
+            D -- Fail --> Y[Return MISSING_REQUIRED_FIELD];
+            D -- OK --> E[Query DynamoDB GSI w/ Filter task_complete=0];
+            E -- DB Error --> F{Transient Error?};
+            F -- Yes --> Z[Return DB_TRANSIENT_ERROR];
+            F -- No --> AA[Return DB_QUERY_ERROR / INTERNAL_ERROR];
+            E -- Success --> G{Results Count?};
+            G -- 0 --> BB[Return CONVERSATION_NOT_FOUND];
+            G -- 1 --> H[Get Record];
+            G -- '>1' --> I{Sort Records by created_at desc};
+            I --> H;
+            H --> J[Update context_object];
+            J --> K[Return valid: True, data: context_object];
+            
+            X --> A;
+            Y --> A;
+            Z --> A;
+            AA --> A;
+            BB --> A;
+            K --> A;
+        ```
     *   **Outcome 1: Transient DB Error:** Returns `{'valid': False, 'error_code': 'DB_TRANSIENT_ERROR', ...}` (Step 6).
     *   **Outcome 2: Other DB/Config Error:** Returns `{'valid': False, 'error_code': 'DB_QUERY_ERROR' or 'CONFIGURATION_ERROR', ...}` (Step 6).
     *   **Outcome 3: No Active Record Found:** Returns `{'valid': False, 'error_code': 'CONVERSATION_NOT_FOUND', ...}` (Step 6).
@@ -88,6 +129,23 @@ X 1.  **Message Batching via SQS Delay:**
         *   **Project Status Check:** Verifies `context_object.get('project_status') == 'active'`. If not, returns `{'valid': False, 'error_code': 'PROJECT_INACTIVE', ...}` (Step 6).
         *   **Allowed Channel Check:** Verifies `context_object.get('channel_type')` is present in the `context_object.get('allowed_channels', [])` list. If not, returns `{'valid': False, 'error_code': 'CHANNEL_NOT_ALLOWED', ...}` (Step 6).
         *   **Concurrency Lock Check:** Verifies `context_object.get('conversation_status') != 'processing_reply'`. If it *is* `'processing_reply'`, returns `{'valid': False, 'error_code': 'CONVERSATION_LOCKED', ...}` (Step 6, leading to special handling).
+    *   **Flow Diagram:**
+        ```mermaid
+        graph TD
+            A[handler w/ updated context_object] --> B(Call validate_conversation_rules);
+            B --> C{project_status == 'active'?};
+            C -- No --> X[Return PROJECT_INACTIVE];
+            C -- Yes --> D{channel_type in allowed_channels?};
+            D -- No --> Y[Return CHANNEL_NOT_ALLOWED];
+            D -- Yes --> E{conversation_status != 'processing_reply'?}
+            E -- No --> Z[Return CONVERSATION_LOCKED];
+            E -- Yes --> F[Return valid: True, data: context_object];
+            
+            X --> A;
+            Y --> A;
+            Z --> A;
+            F --> A;
+        ```
     *   **Success:** If all checks pass, returns `{'valid': True, 'data': context_object}`. The handler proceeds to Step 4.
 
 4.  **Routing Logic:**
