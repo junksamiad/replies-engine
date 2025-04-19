@@ -96,7 +96,7 @@ X 1.  **Message Batching via SQS Delay:**
             A[handler w/ context_object] --> B(Call check_conversation_exists);
             B --> C{Get GSI Config};
             C -- Fail --> X[Return CONFIGURATION_ERROR];
-            C -- OK --> D{Prepare GSI Keys (Strip Prefixes)};
+            C -- OK --> D{Prepare GSI Keys - Strip Prefixes};
             D -- Fail --> Y[Return MISSING_REQUIRED_FIELD];
             D -- OK --> E[Query DynamoDB GSI w/ Filter task_complete=0];
             E -- DB Error --> F{Transient Error?};
