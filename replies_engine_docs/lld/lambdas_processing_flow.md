@@ -56,11 +56,10 @@ X 1.  **Message Batching via SQS Delay:**
         - `Body`: The message text.
         - `MessageSid`: Twilio's unique message identifier (e.g., `SMxxxxxxxx`).
         - `AccountSid`: Twilio Account SID (e.g., `ACyyyyyyyy`).
-        - (Other potential fields like `NumMedia` are parsed but may not be used initially).
-    *   The `handler` calls `create_context_object` (from `utils.parsing_utils`).
-    *   `create_context_object` determines the `channel_type` from `event['path']`.
-    *   It parses the `event['body']` based on the channel (e.g., form-urlencoded for Twilio) into a temporary dictionary.
-    *   It populates a `context_object` dictionary, mapping known fields (e.g., `From`, `MessageSid`) to `snake_case` keys (`from`, `message_sid`) and includes `channel_type`.
+    *   The `handler` calls `utils.parsing_utils.create_context_object(event)`.
+    *   This function determines the `channel_type` from `event['path']`.
+    *   It parses the `event['body']` based on the channel.
+    *   It populates and returns a `context_object` dictionary with `snake_case` keys (or `None` on failure).
     *   **Example Resulting `context_object` (for Twilio WhatsApp):**
         ```python
         {
@@ -70,44 +69,69 @@ X 1.  **Message Batching via SQS Delay:**
             'body': 'Hello there!',
             'message_sid': 'SMxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
             'account_sid': 'ACyyyyyyyyyyyyyyyyyyyyyyyyyyyyy'
-            # Potentially other snake_case keys if present in body
         }
         ```
-    *   It performs basic validation (presence of essential keys) and returns the `context_object` or `None` on failure.
 
-2.  **Conversation Validation:**
-    *   The `handler` receives the `context_object`.
-    *   If `context_object` is `None`, the handler returns a `400 Bad Request` TwiML response.
-    *   Otherwise, the handler calls the core validation logic (e.g., `validation.validate_conversation`), passing the `context_object`.
-    *   This logic queries the `ConversationsTable` using `context_object['from']` (or equivalent sender ID field).
-    *   **Checks Performed:**
-        *   Does a conversation record exist?
-        *   Is the associated `project_status` `active`?
-        *   Is the `channel_type` allowed for this conversation (`allowed_channels` field)?
-        *   **Crucially:** Is the `conversation_status` currently `processing_reply`? (Indicates an active lock by Stage 2).
-    *   **Efficiency:** DynamoDB `ProjectionExpression` is used to retrieve only the necessary fields for validation.
+2.  **Initial Validation & Conversation Retrieval:**
+    *   The `handler` checks if `context_object` is `None`. If so, signals `'PARSING_ERROR'` (Step 6).
+    *   The `handler` calls `core.validation.check_conversation_exists(context_object)`.
+    *   This function queries the appropriate GSI in the `ConversationsTable` using keys derived from the context (e.g., `gsi_company_whatsapp_number`, `gsi_recipient_tel`) and filters for `task_complete = 0`.
+    *   **Outcome 1: Transient DB Error:** Returns `{'valid': False, 'error_code': 'DB_TRANSIENT_ERROR', ...}` (Step 6).
+    *   **Outcome 2: Other DB/Config Error:** Returns `{'valid': False, 'error_code': 'DB_QUERY_ERROR' or 'CONFIGURATION_ERROR', ...}` (Step 6).
+    *   **Outcome 3: No Active Record Found:** Returns `{'valid': False, 'error_code': 'CONVERSATION_NOT_FOUND', ...}` (Step 6).
+    *   **Outcome 4: Multiple Active Records Found:** Logs warning, sorts by `created_at` descending, selects the latest.
+    *   **Outcome 5: Single Active Record Found / Latest Selected:** Updates the `context_object` with all fields from the retrieved DynamoDB record and returns `{'valid': True, 'data': context_object}`. The handler proceeds to Step 3.
 
-3.  **Handling Validation Outcomes:**
-    *   **Hard Failures (No Record, Inactive Project, Disallowed Channel):** The process stops. An error is logged, and an appropriate HTTP error is returned to the webhook provider. Fallback messages to the user are generally avoided unless specifically configured (e.g., for "No Record Found" after a rate-limited check).
-    *   **Concurrency Lock Detected (`status == 'processing_reply'`):** The message cannot be processed now. The `handle_concurrent_message` flow (Step 5 below) is initiated.
-    *   **Success:** All checks pass, and the conversation is not locked. Proceed to queue the message.
+3.  **Conversation Rule Validation:**
+    *   The `handler` calls `core.validation.validate_conversation_rules(context_object)` using the *updated* context object.
+    *   This function performs the following checks sequentially:
+        *   **Project Status Check:** Verifies `context_object.get('project_status') == 'active'`. If not, returns `{'valid': False, 'error_code': 'PROJECT_INACTIVE', ...}` (Step 6).
+        *   **Allowed Channel Check:** Verifies `context_object.get('channel_type')` is present in the `context_object.get('allowed_channels', [])` list. If not, returns `{'valid': False, 'error_code': 'CHANNEL_NOT_ALLOWED', ...}` (Step 6).
+        *   **Concurrency Lock Check:** Verifies `context_object.get('conversation_status') != 'processing_reply'`. If it *is* `'processing_reply'`, returns `{'valid': False, 'error_code': 'CONVERSATION_LOCKED', ...}` (Step 6, leading to special handling).
+    *   **Success:** If all checks pass, returns `{'valid': True, 'data': context_object}`. The handler proceeds to Step 4.
 
-4.  **Routing:**
-    *   After validation, determine the routing path for the message context:
-        - Queue to a channel-specific SQS batch queue.
-        - Queue to a human handoff queue for manual processing.
-        - Handle request failure by returning an error response.
+4.  **Routing Logic:**
+    *   The `handler` calls `core.routing.determine_target_queue(context_object)`.
+    *   This function determines the target queue URL based on the following logic:
+        *   **(Commented Out):** Check `hand_off_to_human == True` -> HANDOFF_QUEUE.
+        *   Check `auto_queue_reply_message == True` -> HANDOFF_QUEUE.
+        *   Check if `recipient_tel/email` is in `auto_queue_reply_message_from_number/email` list -> HANDOFF_QUEUE.
+        *   Otherwise -> Channel-specific queue (WHATSAPP_QUEUE, SMS_QUEUE, EMAIL_QUEUE).
+        ```mermaid
+        graph TD
+            A[Start Routing] --> B{hand_off_to_human == True?};
+            B -- Yes --> Z[HANDOFF_QUEUE];
+            B -- No --> C{auto_queue_reply_message == True?};
+            C -- Yes --> Z;
+            C -- No --> D{Recipient in Auto-Queue List?};
+            D -- Yes --> Z;
+            D -- No --> E{Channel?};
+            E -- WhatsApp --> F[WHATSAPP_QUEUE];
+            E -- SMS --> G[SMS_QUEUE];
+            E -- Email --> H[EMAIL_QUEUE];
+            E -- Other --> I[Error: Unknown Channel];
+        ```
+    *   Returns the determined Queue URL string or `None` on failure.
 
-5.  **Handling Concurrent Messages (When Locked):**
-    *   Triggered if validation detects `status == 'processing_reply'`.
-    *   A specific fallback message is sent to the user explaining that their previous message is still being processed and asking them to wait.
-    *   This fallback is sent using the appropriate channel's API (e.g., Twilio).
-    *   Crucially, an HTTP 200 success response is still returned to the webhook provider.
+5.  **Queue Message:**
+    *   The `handler` checks if a valid `target_queue_url` was returned. If not, signals `'ROUTING_ERROR'` (Step 6).
+    *   The `handler` calls the (placeholder) `services.sqs_service.send_message(target_queue_url, context_object)`.
+    *   **Idempotency Note:** Duplicate message handling (based on `message_sid`) occurs in Stage 2 before DB write.
+    *   **Outcome 1: Queueing Fails:** If `send_message` raises an exception, signals `'QUEUE_ERROR'` (Step 6).
+    *   **Outcome 2: Success:** Proceeds to Step 6.
 
-6. **Acknowledgment:**
-    *   The Lambda returns an HTTP response based on the validation and routing outcome:
-        - **Success:** HTTP 200 with empty TwiML (or appropriate success format).
-        - **Validation or Routing Failure:** Appropriate error status or TwiML response.
+6.  **Acknowledgment / Final Response:**
+    *   The `handler` determines the final HTTP response based on the outcomes of the previous steps.
+    *   It uses the `_determine_final_error_response` helper function, which incorporates the `response_builder` and channel-specific logic (details in Section 4.3):
+        *   **Success (Steps 1-5 complete):** Returns `200 OK` (Empty TwiML for Twilio, JSON for others).
+        *   **Parsing Error (`PARSING_ERROR`):** Returns `200 OK` TwiML (Twilio) or standard 400 JSON (Other).
+        *   **DB Error (`DB_TRANSIENT_ERROR`):** Raises Exception -> API GW sends 5xx -> **Twilio Retries**.
+        *   **DB Error (Other `DB_...`, `CONFIGURATION_ERROR`):** Returns `200 OK` TwiML (Twilio) or standard 500 JSON (Other).
+        *   **Validation Error (`CONVERSATION_NOT_FOUND`, `PROJECT_INACTIVE`, `CHANNEL_NOT_ALLOWED`):** Returns `200 OK` TwiML (Twilio) or standard 404/403 JSON (Other).
+        *   **Validation Error (`CONVERSATION_LOCKED`):** Returns `200 OK` TwiML with specific `<Message>...</Message>` body (Twilio) or standard 409 JSON (Other). *(Note: LLD Step 5 describes sending this message via API, returning 200 TwiML here is an alternative implementation)*.
+        *   **Routing Error (`ROUTING_ERROR`):** Returns `200 OK` TwiML (Twilio) or standard 500 JSON (Other).
+        *   **Queueing Error (`QUEUE_ERROR`):** Returns `200 OK` TwiML (Twilio) or standard 500 JSON (Other). *(Assuming queue error is treated as non-transient for now)*.
+        *   **Unexpected Code Error:** Returns `200 OK` TwiML (Twilio safety net) or standard 500 JSON (Other).
 
 ### 3.2 Stage 2: BatchProcessor Lambda
 
