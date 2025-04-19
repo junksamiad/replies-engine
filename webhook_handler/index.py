@@ -11,6 +11,7 @@ import logging # Import logging
 
 from .utils.parsing_utils import create_context_object
 from .core import validation
+from .core import routing # Import the new routing module
 from .services import sqs_service # Placeholder
 from .utils import response_builder
 
@@ -23,6 +24,8 @@ TRANSIENT_ERROR_CODES = {
     'DB_TRANSIENT_ERROR',
     # Add 'QUEUE_TRANSIENT_ERROR' here when implemented
 }
+
+# Removed placeholder Queue constants - they now live in routing.py
 
 def _determine_final_error_response(context_object, error_code, error_message):
     """
@@ -50,11 +53,22 @@ def _determine_final_error_response(context_object, error_code, error_message):
         else:
             # For ALL other non-transient errors (4xx or unexpected 5xx), return 200 TwiML
             print(f"Mapping non-transient error '{error_code}' to 200 TwiML for Twilio.")
-            return response_builder.create_success_response_twiml()
+            # --- Special handling for CONVERSATION_LOCKED --- 
+            if error_code == 'CONVERSATION_LOCKED':
+                # Per LLD 3.1 Step 5: Send specific message
+                print("Conversation locked, returning specific TwiML message.")
+                return response_builder.create_twiml_error_response(
+                    "I'm processing your previous message. Please wait for my response before sending more."
+                )
+            else:
+                 # For other non-transient errors, return empty TwiML
+                return response_builder.create_success_response_twiml()
     else:
         # Handle other channels (e.g., email): return standard error response
         print(f"Returning standard error response for channel {channel_type} - {error_code}")
         return suggested_response
+
+# Removed _determine_target_queue - it now lives in core/routing.py
 
 def handler(event, context):
     """Main Lambda handler function."""
@@ -84,25 +98,41 @@ def handler(event, context):
         
         context_object = existence_check['data']
 
-        # --- Further Validation Placeholder ---
-        # further_validation_result = validation.validate_further(context_object)
-        # if not further_validation_result['valid']:
-        #    error_code = further_validation_result.get('error_code', 'VALIDATION_FAILED')
-        #    error_message = further_validation_result.get('message', 'Further validation failed')
-        #    return _determine_final_error_response(context_object, error_code, error_message)
-        # context_object = further_validation_result['data']
+        # 2. Validate conversation rules
+        rules_check = validation.validate_conversation_rules(context_object)
+        if not rules_check['valid']:
+            error_code = rules_check.get('error_code', 'VALIDATION_FAILED')
+            error_message = rules_check.get('message', 'Conversation rule validation failed')
+            return _determine_final_error_response(context_object, error_code, error_message)
+        # context_object = rules_check['data'] # context already has the data, no update needed here
 
-        # --- Routing/Queueing Placeholder ---
-        # try:
-        #    queue_url = validation.determine_routing(context_object)
-        #    sqs_service.send_message(queue_url, context_object)
-        # except Exception as e:
-        #    print(f"ERROR during routing/queueing: {e}")
-        #    # Determine if QUEUE_ERROR is transient or not
-        #    return _determine_final_error_response(context_object, 'QUEUE_ERROR', f"Failed process message routing or queueing: {e}")
+        # --- Routing and Queueing --- 
+        # Determine target queue using the imported routing module
+        target_queue_url = routing.determine_target_queue(context_object)
 
+        if not target_queue_url:
+            # Handle routing failure (e.g., unknown channel in _determine_target_queue)
+            print("ERROR: Failed to determine target queue URL.")
+            return _determine_final_error_response(context_object, 'ROUTING_ERROR', "Could not determine message routing queue")
+        
+        # Send to SQS (using services module)
+        print(f"Attempting to send message to queue: {target_queue_url}")
+        # Note: Idempotency check using message_sid should happen in Stage 2 (BatchProcessor)
+        try:
+            # TODO: Implement sqs_service.send_message
+            # sqs_service.send_message(target_queue_url, context_object) 
+            print("[Placeholder] Message sent successfully to SQS.") # Placeholder log
+            pass # Replace with actual call when service is ready
+        except Exception as e:
+            # Handle queueing failure - treat as transient for retry potential?
+            print(f"ERROR queueing message: {e}")
+            # Add QUEUE_ERROR to TRANSIENT_ERROR_CODES if retry is desired
+            return _determine_final_error_response(context_object, 'QUEUE_ERROR', f"Failed process message routing or queueing: {e}")
+        
         # --- Acknowledge Success --- 
-        print("Processing successful. Sending success acknowledgment.")
+        # Add comments about AI handoff check happening later
+        # Placeholder comment: AI processing might set context_object['hand_off_to_human'] = True later
+        print("Routing and queueing successful. Sending success acknowledgment.")
         if context_object['channel_type'] in ['whatsapp', 'sms']:
             return response_builder.create_success_response_twiml()
         else:
