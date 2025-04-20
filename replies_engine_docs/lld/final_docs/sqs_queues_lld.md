@@ -27,6 +27,7 @@ WhatsAppQueue:
   Type: AWS::SQS::Queue
   Properties:
     QueueName: !Sub '${ProjectPrefix}-whatsapp-queue-${EnvironmentName}'
+    SqsManagedSseEnabled: true
     DelaySeconds: 0 # Default queue delay is 0; Batching delay (W) is set per-message by StagingLambda
     VisibilityTimeout: 905 # Slightly higher than MessagingLambda timeout (900s assumed)
     MessageRetentionPeriod: 345600 # 4 days (in seconds)
@@ -49,6 +50,7 @@ WhatsAppDLQ:
   Type: AWS::SQS::Queue
   Properties:
     QueueName: !Sub '${ProjectPrefix}-whatsapp-dlq-${EnvironmentName}'
+    SqsManagedSseEnabled: true
     MessageRetentionPeriod: 1209600 # 14 days (in seconds)
 ```
 
@@ -83,6 +85,7 @@ HumanHandoffQueue:
   Type: AWS::SQS::Queue
   Properties:
     QueueName: !Sub '${ProjectPrefix}-human-handoff-queue-${EnvironmentName}'
+    SqsManagedSseEnabled: true
     DelaySeconds: 0 # No delay for human intervention
     VisibilityTimeout: 3600 # Example: 1 hour visibility for manual action
     MessageRetentionPeriod: 604800 # 7 days (in seconds) - Longer retention suitable for manual queues
