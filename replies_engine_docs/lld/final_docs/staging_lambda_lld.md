@@ -134,7 +134,46 @@ The `StagingLambda` (Stage 1) function acts as the central, unified, and fast en
         *   PK: `conversation_id`
         *   SK: `message_sid` (or timestamp)
         *   Attributes: `context_object` (full map), `received_at` (ISO timestamp), optional `expires_at` TTL.
-    *   *On Failure:* Log error. Consider if this is transient (`'STAGE_WRITE_ERROR_TRANSIENT'`) or permanent (`'STAGE_WRITE_ERROR'`). Handler proceeds to Step 8.
+    *   *On Failure:* Log error. Catch specific `ClientError` exceptions from DynamoDB. Map known transient AWS error codes (e.g., `ProvisionedThroughputExceededException`, `InternalServerError`, `ThrottlingException`) to a specific internal error code like `'STAGE_DB_TRANSIENT_ERROR'`. Map configuration errors (e.g., `ResourceNotFoundException`, `AccessDeniedException`) to `'STAGE_DB_CONFIG_ERROR'`. Map data validation errors (`ValidationException`) to `'STAGE_DB_VALIDATION_ERROR'`. Use a default `'STAGE_WRITE_ERROR'` for other client errors. Handle unexpected Python errors with `'INTERNAL_ERROR'`. The handler then proceeds to Step 8 using the determined internal error code.
+    *   **Example Error Handling Snippet:**
+        ```python
+        # Within the handler, after determining item_to_write
+        try:
+            staging_table.put_item(Item=item_to_write)
+            # Success, proceed to Step 6
+        except ClientError as e:
+            aws_error_code = e.response.get('Error', {}).get('Code')
+            print(f"ERROR writing to staging table: {aws_error_code} - {e}")
+            internal_error_code = 'STAGE_WRITE_ERROR' # Default
+            
+            transient_codes = [
+                'ProvisionedThroughputExceededException', 
+                'InternalServerError', 
+                'ThrottlingException', 
+                'RequestLimitExceeded'
+            ]
+            config_codes = [
+                 'ResourceNotFoundException', 
+                 'AccessDeniedException'
+            ]
+
+            if aws_error_code in transient_codes:
+                internal_error_code = 'STAGE_DB_TRANSIENT_ERROR'
+            elif aws_error_code in config_codes:
+                 internal_error_code = 'STAGE_DB_CONFIG_ERROR'
+            elif aws_error_code == 'ValidationException':
+                 internal_error_code = 'STAGE_DB_VALIDATION_ERROR'
+
+            # Proceed to Step 8 (Acknowledgment/Final Response)
+            # The handler will call _determine_final_error_response with this internal_error_code
+            return _determine_final_error_response(context_object, internal_error_code, f"Failed to write to staging DB: {aws_error_code}")
+        except Exception as e:
+            # Catch other unexpected errors
+            print(f"FATAL ERROR during staging write: {e}")
+            logger.exception("Unhandled exception during staging write")
+            # Proceed to Step 8 (Acknowledgment/Final Response)
+            return _determine_final_error_response(context_object, 'INTERNAL_ERROR', "Unexpected error during staging write")
+        ```
     *   *On Success:* Handler proceeds to Step 6.
 
 6.  **Attempt Trigger Scheduling Lock (`conversations-trigger-lock`):**
@@ -143,9 +182,47 @@ The `StagingLambda` (Stage 1) function acts as the central, unified, and fast en
     *   **Item:** `{ "conversation_id": "...", "expires_at": now + W + buffer }`
     *   **Condition:** `attribute_not_exists(conversation_id)`
     *   *On Success (Lock Acquired):* Set a flag `trigger_lock_acquired = True`. Proceed to Step 7.
-    *   *On Failure (Lock Exists - `ConditionalCheckFailedException`):* Set `trigger_lock_acquired = False`. Log info. Proceed to Step 7.
-    *   *On Failure (Other DB Error):* Log error. Signal `'TRIGGER_LOCK_ERROR'`. Handler proceeds to Step 8.
-    *   *(See `trigger_lock_mechanism_lld.md` for more detail if needed)*.
+    *   *On Failure (Lock Exists - `ConditionalCheckFailedException`):* This is the expected outcome if a trigger is already pending. Set `trigger_lock_acquired = False`. Log info. Proceed to Step 7 (will skip SQS send).
+    *   *On Failure (Other DB Error):* Log error. Catch specific `ClientError` exceptions from DynamoDB. Map known transient AWS error codes to `'TRIGGER_DB_TRANSIENT_ERROR'`. Map configuration errors to `'TRIGGER_DB_CONFIG_ERROR'`. Map validation errors to `'TRIGGER_DB_VALIDATION_ERROR'`. Use a default `'TRIGGER_LOCK_WRITE_ERROR'` for others. Handle unexpected Python errors with `'INTERNAL_ERROR'`. The handler then proceeds to Step 8 using the determined internal error code.
+    *   **Example Error Handling Snippet:**
+        ```python
+        # Within the handler, after checking target_queue_url
+        trigger_lock_acquired = False
+        if target_queue_url != HUMAN_HANDOFF_QUEUE_URL:
+            try:
+                lock_item = { 
+                    'conversation_id': context_object['conversation_id'],
+                    'expires_at': int(time.time()) + 10 + 60 # W=10, Buffer=60
+                }
+                trigger_lock_table.put_item(
+                    Item=lock_item,
+                    ConditionExpression='attribute_not_exists(conversation_id)'
+                )
+                trigger_lock_acquired = True # Lock successfully acquired
+                print(f"Acquired trigger lock for {context_object['conversation_id']}")
+            except ClientError as e:
+                aws_error_code = e.response.get('Error', {}).get('Code')
+                if aws_error_code == 'ConditionalCheckFailedException':
+                    # This is expected if trigger already pending
+                    print(f"Trigger lock already exists for {context_object['conversation_id']}. Skipping SQS send.")
+                    trigger_lock_acquired = False # Ensure flag is false
+                else:
+                    # Handle other DynamoDB errors similarly to Step 5
+                    print(f"ERROR acquiring trigger lock: {aws_error_code} - {e}")
+                    internal_error_code = 'TRIGGER_LOCK_WRITE_ERROR' # Default
+                    # ... (map transient/config/validation codes) ...
+                    if aws_error_code in transient_codes: # Assume transient_codes defined
+                        internal_error_code = 'TRIGGER_DB_TRANSIENT_ERROR'
+                    # ... (other mappings) ...
+                    # Proceed to Step 8
+                    return _determine_final_error_response(context_object, internal_error_code, f"Failed to acquire trigger lock: {aws_error_code}")
+            except Exception as e:
+                 print(f"FATAL ERROR during trigger lock attempt: {e}")
+                 logger.exception("Unhandled exception during trigger lock")
+                 return _determine_final_error_response(context_object, 'INTERNAL_ERROR', "Unexpected error during trigger lock")
+        
+        # Proceed to Step 7 with trigger_lock_acquired flag set...
+        ```
 
 7.  **Queue Message (Conditional):**
     *   **If `target_queue_url` is `HumanHandoffQueue`:**
