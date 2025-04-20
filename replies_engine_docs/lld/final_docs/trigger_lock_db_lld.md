@@ -82,6 +82,13 @@ When a validated message arrives and needs to potentially trigger the batch proc
 
     ```
 
+> **Cleanup Timing Note (UPDATED):**
+> The lock item **is not deleted** by the `StagingLambda`.  It remains in the table so that retries/parallel webhook invocations within the same window see the lock and skip additional triggers.  The item is explicitly deleted **only after** the `MessagingLambda` has:
+> 1. Successfully appended the merged user turn to the main conversation record, **and**
+> 2. Forwarded the enriched `context_object` to the downstream processor.
+>
+> This explicit delete (performed in Step 10 of `messaging_lambda`) is in addition to the TTL expiry, ensuring fast reuse of the conversation if the downstream processing finishes quickly while also providing a fallback auto‑clean in case of failure.
+
 ## 5. Outcome & Benefits
 
 *   **On Success (First Message):** If the `PutItem` succeeds (no existing item with that `conversation_id`), a simple record `{ "conversation_id": "...", "expires_at": ... }` is created in the `conversations-trigger-lock` table. The handler then proceeds to send the single SQS trigger message **to the appropriate Channel Queue** with `DelaySeconds=W`.

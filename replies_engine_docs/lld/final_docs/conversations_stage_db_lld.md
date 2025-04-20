@@ -26,8 +26,11 @@ A dedicated DynamoDB table is used for this temporary storage.
 *   **Key Attributes:**
     *   `conversation_id` (String): The PK.
     *   `message_sid` (String): The SK.
-    *   `context_object` (Map): The full, validated context object derived from parsing, validation, and DB lookups. Contains all necessary details about the message and the conversation state *at the time of receipt*.
-    *   `received_at` (String): ISO 8601 timestamp indicating when the message was received and processed by the handler.
+    *   `primary_channel` (String): The channel identifier (e.g., the company WhatsApp number). Allows direct `GetItem` on the main Conversations table without using GSIs.
+    *   `body` (String): The raw text content of the incoming user fragment.
+    *   `sender_id` (String, Optional): Identifier of the sender (useful for deduplication / audit).
+    *   `received_at` (String **or** Number): UTC ISO‑8601 timestamp (or epoch seconds) of when the fragment was received.
+    *   `expires_at` (Number – TTL): Unix epoch seconds. `now + W + buffer` so DynamoDB auto‑purges the row after the batch window.
 *   **TTL (Optional but Recommended):** Consider adding a TTL attribute (e.g., `expires_at`) set to a reasonable duration (e.g., 24-72 hours) to automatically clean up any records that might somehow be orphaned if the `BatchProcessorLambda` fails permanently. This acts as a safety net.
 
 ## 4. Process within `webhook_handler`
@@ -57,10 +60,13 @@ After successfully determining the `target_queue_url` for a validated `context_o
     stage_item = {
         'conversation_id': conversation_id,
         'message_sid': message_sid,
-        'context_object': context_object, # Store the whole object
-        'received_at': received_at_iso
-        # Optional TTL:
-        # 'expires_at': int(time.time()) + (72 * 3600) # e.g., 72 hours
+        'primary_channel': context_object['primary_channel'],
+        'body': context_object['body'],
+        # Optional depending on channel/provider:
+        'sender_id': context_object.get('sender_id'),
+        'received_at': received_at_iso,
+        # TTL so DynamoDB cleans up after batch window + safety buffer
+        'expires_at': int(time.time()) + (W + BUFFER)
     }
 
     ```

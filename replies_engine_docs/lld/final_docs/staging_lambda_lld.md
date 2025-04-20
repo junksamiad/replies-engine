@@ -132,8 +132,13 @@ The `StagingLambda` (Stage 1) function acts as the central, unified, and fast en
     *   **Action:** Perform a `PutItem` operation on the `conversations-stage` table.
     *   **Item:**
         *   PK: `conversation_id`
-        *   SK: `message_sid` (or timestamp)
-        *   Attributes: `context_object` (full map), `received_at` (ISO timestamp), optional `expires_at` TTL.
+        *   SK: `message_sid`
+        *   Attributes:
+            *   `primary_channel` – value copied from the incoming conversation record (e.g., company WhatsApp number)
+            *   `body` – raw user message fragment
+            *   `sender_id` (optional) – user identifier useful for audit/deduplication
+            *   `received_at` – ISO‑8601 (or epoch) timestamp when fragment arrived
+            *   `expires_at` – Unix epoch seconds (`now + W + buffer`) so DynamoDB TTL auto‑purges after the batch window.
     *   *On Failure:* Log error. Catch specific `ClientError` exceptions from DynamoDB. Map known transient AWS error codes (e.g., `ProvisionedThroughputExceededException`, `InternalServerError`, `ThrottlingException`) to a specific internal error code like `'STAGE_DB_TRANSIENT_ERROR'`. Map configuration errors (e.g., `ResourceNotFoundException`, `AccessDeniedException`) to `'STAGE_DB_CONFIG_ERROR'`. Map data validation errors (`ValidationException`) to `'STAGE_DB_VALIDATION_ERROR'`. Use a default `'STAGE_WRITE_ERROR'` for other client errors. Handle unexpected Python errors with `'INTERNAL_ERROR'`. The handler then proceeds to Step 8 using the determined internal error code.
     *   **Example Error Handling Snippet:**
         ```python

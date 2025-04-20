@@ -105,8 +105,7 @@ The message sent by `StagingLambda` to these queues contains the initial context
 ```json
 {
   "conversation_id": "abc123def456"
-  // Optionally include other identifiers if needed immediately by MessagingLambda
-  // before the staging table query, but keep it minimal.
+  // Optionally include other lightweight hints (e.g., primary_channel) but **do not** include the full context; the MessagingLambda will hydrate from DynamoDB.
 }
 ```
 
