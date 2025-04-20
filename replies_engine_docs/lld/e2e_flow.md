@@ -95,7 +95,7 @@ sequenceDiagram
         ProcessorLambda->>ProcessorLambda: Process/Merge Batch
         ProcessorLambda->>+SQS_Target: Send Processed Batch
         ProcessorLambda->>+HoldingDB: Delete Processed Msgs (M1, M2)
-        ProcessorLambda->>+StateDB: Delete Trigger State (Optional)
+        ProcessorLambda->>StateDB: Delete Trigger State (Optional)
         ProcessorLambda->>+ConvDB: Release Processing Lock (Update Status)
         ConvDB-->>-ProcessorLambda: OK
     else Lock Failed (Other processor active)
