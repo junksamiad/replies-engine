@@ -28,7 +28,6 @@ The `StagingLambda` (Stage 1) function acts as the central, unified, and fast en
 *   **AWS SQS:**
     *   Channel Queues (`WhatsAppQueue`, `SMSQueue`, `EmailQueue`): (Send Message with Delay) To send trigger messages for `MessagingLambda`.
     *   `HumanHandoffQueue`: (Send Message) To queue messages for manual review.
-*   **AWS Secrets Manager:** (Read-only) To fetch Twilio credentials for webhook signature validation (if implemented).
 *   **AWS CloudWatch Logs:** For logging execution details and errors.
 *   **Internal Libraries/Utils:**
     *   `utils/parsing_utils.py`: For `create_context_object`.
@@ -134,10 +133,9 @@ The `StagingLambda` (Stage 1) function acts as the central, unified, and fast en
     *   **Item:**
         *   PK: `conversation_id`
         *   SK: `message_sid` (or timestamp)
-        *   Attributes: `context_object` (full map), `target_queue_url`, `received_at` (ISO timestamp), optional `expires_at` TTL.
+        *   Attributes: `context_object` (full map), `received_at` (ISO timestamp), optional `expires_at` TTL.
     *   *On Failure:* Log error. Consider if this is transient (`'STAGE_WRITE_ERROR_TRANSIENT'`) or permanent (`'STAGE_WRITE_ERROR'`). Handler proceeds to Step 8.
     *   *On Success:* Handler proceeds to Step 6.
-    *   *(See `conversations_stage_write_lld.md` for more detail if needed)*.
 
 6.  **Attempt Trigger Scheduling Lock (`conversations-trigger-lock`):**
     *   **Condition:** Only attempt if `target_queue_url` is *not* the `HumanHandoffQueue`.
