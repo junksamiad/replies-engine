@@ -14,13 +14,13 @@ This LLD focuses on the IAM roles and policies required for the core components 
 
 ## 2. Core IAM Roles
 
-### 2.1 IncomingWebhookHandler Role
+### 2.1 StagingLambda Role
 
 ```yaml
-IncomingWebhookHandlerRole:
+StagingLambdaRole:
   Type: AWS::IAM::Role
   Properties:
-    RoleName: !Sub '${ProjectPrefix}-incoming-webhook-handler-role-${EnvironmentName}'
+    RoleName: !Sub '${ProjectPrefix}-staging-lambda-role-${EnvironmentName}'
     AssumeRolePolicyDocument:
       Version: '2012-10-17'
       Statement:
@@ -31,7 +31,7 @@ IncomingWebhookHandlerRole:
     ManagedPolicyArns:
       - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
     Policies:
-      - PolicyName: !Sub '${ProjectPrefix}-incoming-webhook-handler-policy-${EnvironmentName}'
+      - PolicyName: !Sub '${ProjectPrefix}-staging-lambda-policy-${EnvironmentName}'
         PolicyDocument:
           Version: '2012-10-17'
           Statement:
@@ -39,18 +39,23 @@ IncomingWebhookHandlerRole:
             - Effect: Allow
               Action:
                 - dynamodb:Query
+                - dynamodb:PutItem
               Resource:
                 - !GetAtt ConversationsTable.Arn
                 - !Sub '${ConversationsTable.Arn}/index/*'
-              
+                - !GetAtt ConversationsStageTable.Arn
+                - !GetAtt ConversationsTriggerLockTable.Arn
+
             # SQS Permissions
             - Effect: Allow
               Action:
                 - sqs:SendMessage
               Resource:
-                - !GetAtt WhatsAppRepliesQueue.Arn
+                - !GetAtt WhatsAppQueue.Arn
+                - !GetAtt SMSQueue.Arn
+                - !GetAtt EmailQueue.Arn
                 - !GetAtt HumanHandoffQueue.Arn
-                
+
             # Secrets Manager Permissions
             - Effect: Allow
               Action:
@@ -59,13 +64,13 @@ IncomingWebhookHandlerRole:
                 - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectPrefix}/whatsapp-credentials/*/*/twilio-*'
 ```
 
-### 2.2 ReplyProcessorLambda Role
+### 2.2 MessagingLambda Role
 
 ```yaml
-ReplyProcessorLambdaRole:
+MessagingLambdaRole:
   Type: AWS::IAM::Role
   Properties:
-    RoleName: !Sub '${ProjectPrefix}-reply-processor-role-${EnvironmentName}'
+    RoleName: !Sub '${ProjectPrefix}-messaging-lambda-role-${EnvironmentName}'
     AssumeRolePolicyDocument:
       Version: '2012-10-17'
       Statement:
@@ -76,7 +81,7 @@ ReplyProcessorLambdaRole:
     ManagedPolicyArns:
       - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
     Policies:
-      - PolicyName: !Sub '${ProjectPrefix}-reply-processor-policy-${EnvironmentName}'
+      - PolicyName: !Sub '${ProjectPrefix}-messaging-lambda-policy-${EnvironmentName}'
         PolicyDocument:
           Version: '2012-10-17'
           Statement:
@@ -85,30 +90,38 @@ ReplyProcessorLambdaRole:
               Action:
                 - dynamodb:GetItem
                 - dynamodb:UpdateItem
+                - dynamodb:Query
+                - dynamodb:BatchWriteItem
+                - dynamodb:DeleteItem
               Resource:
                 - !GetAtt ConversationsTable.Arn
-                
+                - !GetAtt ConversationsStageTable.Arn
+                - !GetAtt ConversationsTriggerLockTable.Arn
+
             # SQS Permissions
             - Effect: Allow
               Action:
                 - sqs:ReceiveMessage
                 - sqs:DeleteMessage
                 - sqs:GetQueueAttributes
+                - sqs:SendMessage
               Resource:
-                - !GetAtt WhatsAppRepliesQueue.Arn
-                
+                - !GetAtt WhatsAppQueue.Arn
+                - !GetAtt SMSQueue.Arn
+                - !GetAtt EmailQueue.Arn
+                - !GetAtt HumanHandoffQueue.Arn
+
             # Secrets Manager Permissions
             - Effect: Allow
               Action:
                 - secretsmanager:GetSecretValue
               Resource:
                 - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectPrefix}/whatsapp-credentials/*/*/twilio-*'
-                - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectPrefix}/openai-api-key/whatsapp-*'
 ```
 
 ## 3. Policy Details and Rationale
 
-### 3.1 IncomingWebhookHandler Lambda Policies
+### 3.1 StagingLambda Policies
 
 #### 3.1.1 DynamoDB Access
 
@@ -116,15 +129,17 @@ ReplyProcessorLambdaRole:
 - Effect: Allow
   Action:
     - dynamodb:Query
+    - dynamodb:PutItem
   Resource:
     - !GetAtt ConversationsTable.Arn
     - !Sub '${ConversationsTable.Arn}/index/*'
+    - !GetAtt ConversationsStageTable.Arn
+    - !GetAtt ConversationsTriggerLockTable.Arn
 ```
 
 **Rationale:**
-- `dynamodb:Query` permission allows the Lambda to look up conversation records by recipient phone number.
-- Access to all indexes is required to support querying by different attributes (e.g., recipient_tel).
-- No write permissions are granted since this function only needs to read conversation data.
+- `dynamodb:Query` permission allows the Lambda to look up conversation records by GSI.
+- `dynamodb:PutItem` allows writing the context to the `conversations-stage` table and attempting the conditional write to the `conversations-trigger-lock` table.
 
 #### 3.1.2 SQS Access
 
@@ -133,30 +148,16 @@ ReplyProcessorLambdaRole:
   Action:
     - sqs:SendMessage
   Resource:
-    - !GetAtt WhatsAppRepliesQueue.Arn
+    - !GetAtt WhatsAppQueue.Arn
+    - !GetAtt SMSQueue.Arn
+    - !GetAtt EmailQueue.Arn
     - !GetAtt HumanHandoffQueue.Arn
 ```
 
 **Rationale:**
-- `sqs:SendMessage` permission allows the Lambda to send messages to both the AI processing queue and the human handoff queue.
-- No receive or delete permissions are needed since this function only sends messages.
+- `sqs:SendMessage` permission allows the Lambda to send trigger messages (with delay) to the Channel Queues or context messages (no delay) to the Human Handoff queue.
 
-#### 3.1.3 Secrets Manager Access
-
-```yaml
-- Effect: Allow
-  Action:
-    - secretsmanager:GetSecretValue
-  Resource:
-    - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectPrefix}/whatsapp-credentials/*/*/twilio-*'
-```
-
-**Rationale:**
-- Access to Twilio credentials is required for webhook signature validation.
-- The resource pattern allows access to Twilio secrets across all companies/projects.
-- Limited to only the GetSecretValue action for least privilege.
-
-### 3.2 ReplyProcessorLambda Policies
+### 3.2 MessagingLambda Policies
 
 #### 3.2.1 DynamoDB Access
 
@@ -165,14 +166,19 @@ ReplyProcessorLambdaRole:
   Action:
     - dynamodb:GetItem
     - dynamodb:UpdateItem
+    - dynamodb:Query
+    - dynamodb:BatchWriteItem
+    - dynamodb:DeleteItem
   Resource:
     - !GetAtt ConversationsTable.Arn
+    - !GetAtt ConversationsStageTable.Arn
+    - !GetAtt ConversationsTriggerLockTable.Arn
 ```
 
 **Rationale:**
-- `dynamodb:GetItem` permission allows the Lambda to retrieve conversation details if needed.
-- `dynamodb:UpdateItem` permission allows the Lambda to update the conversation with new messages.
-- Access is limited to just the ConversationsTable, not indexes, since this function will access by primary key.
+- `dynamodb:GetItem`/`UpdateItem` for reading and locking/unlocking the main conversation record.
+- `dynamodb:Query`/`BatchWriteItem` for reading the message batch from and deleting it from the `conversations-stage` table.
+- `dynamodb:DeleteItem` for cleaning up the `conversations-trigger-lock` entry.
 
 #### 3.2.2 SQS Access
 
@@ -182,30 +188,17 @@ ReplyProcessorLambdaRole:
     - sqs:ReceiveMessage
     - sqs:DeleteMessage
     - sqs:GetQueueAttributes
+    - sqs:SendMessage
   Resource:
-    - !GetAtt WhatsAppRepliesQueue.Arn
+    - !GetAtt WhatsAppQueue.Arn
+    - !GetAtt SMSQueue.Arn
+    - !GetAtt EmailQueue.Arn
+    - !GetAtt HumanHandoffQueue.Arn
 ```
 
 **Rationale:**
-- `sqs:ReceiveMessage` and `sqs:DeleteMessage` permissions are required for processing messages from the queue.
-- `sqs:GetQueueAttributes` allows the Lambda to check queue attributes if needed.
-- Access is limited to just the WhatsApp replies queue since this function doesn't interact with the human handoff queue.
-
-#### 3.2.3 Secrets Manager Access
-
-```yaml
-- Effect: Allow
-  Action:
-    - secretsmanager:GetSecretValue
-  Resource:
-    - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectPrefix}/whatsapp-credentials/*/*/twilio-*'
-    - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectPrefix}/openai-api-key/whatsapp-*'
-```
-
-**Rationale:**
-- Access to Twilio credentials is required for sending WhatsApp messages.
-- Access to OpenAI API keys is required for interacting with the OpenAI Assistants API.
-- The resource patterns allow access to secrets across all companies/projects.
+- Read permissions (`ReceiveMessage`, `DeleteMessage`, `GetQueueAttributes`) are needed for the Channel Queues that trigger this Lambda.
+- `sqs:SendMessage` allows the Lambda to send the processed/merged payload to the *next* stage (e.g., AI queue, or potentially Human Handoff if logic dictates, though Handoff is usually determined by `StagingLambda`). Adjust target resources based on actual downstream queues.
 
 ## 4. Additional Considerations
 
@@ -282,23 +275,23 @@ To maintain separation of concerns:
 ### 6.1 Manual Implementation Steps
 
 ```bash
-# Create IncomingWebhookHandler Role
+# Create StagingLambda Role
 aws iam create-role \
-  --role-name ai-multi-comms-incoming-webhook-handler-role-dev \
-  --assume-role-policy-document file://webhook-handler-trust-policy.json
+  --role-name ai-multi-comms-staging-lambda-role-dev \
+  --assume-role-policy-document file://staging-lambda-trust-policy.json
 
 # Attach AWSLambdaBasicExecutionRole
 aws iam attach-role-policy \
-  --role-name ai-multi-comms-incoming-webhook-handler-role-dev \
+  --role-name ai-multi-comms-staging-lambda-role-dev \
   --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
 # Create and attach custom policy
 aws iam put-role-policy \
-  --role-name ai-multi-comms-incoming-webhook-handler-role-dev \
-  --policy-name ai-multi-comms-incoming-webhook-handler-policy-dev \
-  --policy-document file://webhook-handler-policy.json
+  --role-name ai-multi-comms-staging-lambda-role-dev \
+  --policy-name ai-multi-comms-staging-lambda-policy-dev \
+  --policy-document file://staging-lambda-policy.json
 
-# Similar commands for ReplyProcessorLambda Role
+# Similar commands for MessagingLambda Role
 ```
 
 ### 6.2 Testing Approach
@@ -332,47 +325,47 @@ In the future SAM template, these roles will be defined as:
 
 ```yaml
 Resources:
-  # IncomingWebhookHandler Role
-  IncomingWebhookHandlerRole:
+  # StagingLambda Role
+  StagingLambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${ProjectPrefix}-incoming-webhook-handler-role-${EnvironmentName}'
+      RoleName: !Sub '${ProjectPrefix}-staging-lambda-role-${EnvironmentName}'
       AssumeRolePolicyDocument: { ... }
       ManagedPolicyArns:
         - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
       Policies:
-        - PolicyName: !Sub '${ProjectPrefix}-incoming-webhook-handler-policy-${EnvironmentName}'
+        - PolicyName: !Sub '${ProjectPrefix}-staging-lambda-policy-${EnvironmentName}'
           PolicyDocument: { ... }
 
-  # ReplyProcessorLambda Role
-  ReplyProcessorLambdaRole:
+  # MessagingLambda Role
+  MessagingLambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${ProjectPrefix}-reply-processor-role-${EnvironmentName}'
+      RoleName: !Sub '${ProjectPrefix}-messaging-lambda-role-${EnvironmentName}'
       AssumeRolePolicyDocument: { ... }
       ManagedPolicyArns:
         - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
       Policies:
-        - PolicyName: !Sub '${ProjectPrefix}-reply-processor-policy-${EnvironmentName}'
+        - PolicyName: !Sub '${ProjectPrefix}-messaging-lambda-policy-${EnvironmentName}'
           PolicyDocument: { ... }
 
   # Lambda Functions using these roles
-  IncomingWebhookHandlerFunction:
+  StagingLambdaFunction:
     Type: AWS::Serverless::Function
     Properties:
       # ... other properties
-      Role: !GetAtt IncomingWebhookHandlerRole.Arn
+      Role: !GetAtt StagingLambdaRole.Arn
 
-  ReplyProcessorLambdaFunction:
+  MessagingLambdaFunction:
     Type: AWS::Serverless::Function
     Properties:
       # ... other properties
-      Role: !GetAtt ReplyProcessorLambdaRole.Arn
+      Role: !GetAtt MessagingLambdaRole.Arn
 ```
 
 ## 8. Happy Path Analysis
 
-### 8.1 IncomingWebhookHandler IAM Role
+### 8.1 StagingLambda IAM Role
 
 #### Preconditions
 - IAM role and policies are created with correct permissions
@@ -389,7 +382,7 @@ Resources:
 - No unauthorized access attempts occur
 - Operational logging shows successful authentication
 
-### 8.2 ReplyProcessorLambda IAM Role
+### 8.2 MessagingLambda IAM Role
 
 #### Preconditions
 - IAM role and policies are created with correct permissions
@@ -434,7 +427,7 @@ Resources:
 
 ## 10. Next Steps
 
-1. Create IAM roles and policies via AWS CLI
+1. Create IAM roles and policies via AWS CLI or SAM
 2. Test permissions using AWS Policy Simulator
 3. Associate roles with Lambda functions
 4. Verify access patterns with test invocations

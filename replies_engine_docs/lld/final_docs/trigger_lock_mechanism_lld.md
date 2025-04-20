@@ -2,7 +2,7 @@
 
 ## 1. Purpose
 
-This document details the mechanism used within the `webhook_handler` Lambda (Stage 1) to ensure that only **one** SQS trigger message is sent to the `BatchProcessorLambda` (Stage 2) for each desired conversation batching window (defined by `W` seconds). This prevents redundant processor invocations when multiple messages (M1, M2, etc.) arrive for the same conversation in quick succession.
+This document details the mechanism used within the `StagingLambda` (Stage 1) to ensure that only **one** SQS trigger message is sent to the appropriate **Channel Queue** (e.g., `WhatsAppQueue`, triggering the `MessagingLambda` - Stage 2) for each desired conversation batching window (defined by `W` seconds). This prevents redundant processor invocations when multiple messages (M1, M2, etc.) arrive for the same conversation in quick succession.
 
 ## 2. Mechanism: Atomic Conditional Write
 
@@ -24,12 +24,12 @@ A dedicated, simple DynamoDB table is used solely for managing these temporary t
     *   `expires_at` (Type: Number): A Unix epoch timestamp (seconds since Jan 1, 1970). This attribute is configured as the **Time To Live (TTL)** attribute for the table, enabling automatic item deletion by DynamoDB after the specified time.
 *   **Purpose of Table:** This table acts purely as a temporary flag or marker. It indicates "a trigger message has already been scheduled for this conversation's current batch window". It does **not** store any actual message content.
 
-## 4. Process within `webhook_handler`
+## 4. Process within `StagingLambda`
 
 When a validated message arrives and needs to potentially trigger the batch processor:
 
-1.  **Calculate Expiry Time:** Determine the Unix epoch timestamp when this lock record should automatically expire. This should be *after* the SQS delay (`W`) plus a safety buffer to account for SQS processing time and potential visibility timeout variations.
-    *   `W`: The SQS Trigger Delay Queue's `DelaySeconds` value (e.g., 10 seconds).
+1.  **Calculate Expiry Time:** Determine the Unix epoch timestamp when this lock record should automatically expire. This should be *after* the SQS message delay (`W`) plus a safety buffer to account for SQS processing time and potential visibility timeout variations.
+    *   `W`: The `DelaySeconds` value (e.g., 10 seconds) to be set on the trigger message sent to the Channel Queue.
     *   `buffer`: A safety margin (e.g., 60 seconds).
     *   `expiry_timestamp = current_epoch_time + W + buffer`
 2.  **Prepare DynamoDB Item:** Construct the item to be written. Using `boto3.resource`:
@@ -64,9 +64,9 @@ When a validated message arrives and needs to potentially trigger the batch proc
             ConditionExpression='attribute_not_exists(conversation_id)'
         )
         # --- Success! PutItem was successful, meaning no lock existed. ---
-        # Proceed to send the SQS Trigger Message here
-        print(f"Successfully acquired trigger lock for {conversation_id}. Sending SQS trigger.")
-        # sqs_service.send_trigger_message(conversation_id, W) # Example call
+        # Proceed to send the SQS Trigger Message to the appropriate Channel Queue here
+        print(f"Successfully acquired trigger lock for {conversation_id}. Sending SQS trigger to Channel Queue.")
+        # sqs_service.send_trigger_message(channel_queue_url, conversation_id, W) # Example call
 
     except ClientError as e:
         if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
@@ -84,7 +84,7 @@ When a validated message arrives and needs to potentially trigger the batch proc
 
 ## 5. Outcome & Benefits
 
-*   **On Success (First Message):** If the `PutItem` succeeds (no existing item with that `conversation_id`), a simple record `{ "conversation_id": "...", "expires_at": ... }` is created in the `conversations-trigger-lock` table. The handler then proceeds to send the single SQS trigger message.
+*   **On Success (First Message):** If the `PutItem` succeeds (no existing item with that `conversation_id`), a simple record `{ "conversation_id": "...", "expires_at": ... }` is created in the `conversations-trigger-lock` table. The handler then proceeds to send the single SQS trigger message **to the appropriate Channel Queue** with `DelaySeconds=W`.
 *   **On Failure (Subsequent Messages):** If the `PutItem` fails with `ConditionalCheckFailedException`, it means a lock record already exists (placed by a previous message in the window). The handler simply catches this specific exception and does *not* send another SQS trigger message.
 *   **Self-Cleaning:** The `expires_at` TTL attribute ensures DynamoDB automatically deletes the lock record shortly after the batch window and processing *should* have completed, eliminating the need for explicit deletion logic for the lock itself.
 *   **Robustness:** This mechanism provides an effective, atomic, and self-maintaining way to achieve the "send trigger only once per batch window" requirement. 

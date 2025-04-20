@@ -1,21 +1,21 @@
 # Lambda 1 & 2 Processing Flow - Low-Level Design
 
-This document describes the low-level design for the two lambda's deployed in the webhook processing system, encompassing the initial `webhook_handler` Lambda (Stage 1) and the subsequent `replies_processor` Lambda (Stage 2). It details the architecture for handling incoming webhooks across multiple channels and then full processing of the messages they contain.
+This document describes the low-level design for the two lambda's deployed in the webhook processing system, encompassing the initial `StagingLambda` (Stage 1) and the subsequent `MessagingLambda` (Stage 2). It details the architecture for handling incoming webhooks across multiple channels and then full processing of the messages they contain.
 
 ## 1. Purpose and Responsibilities
 
 The system employs a two-stage architecture to handle incoming messages efficiently and reliably:
 
-1.  **webhook_handler Lambda (Stage 1):** This function acts as the central, unified entry point for all webhook requests.
+1.  **StagingLambda (Stage 1):** This function acts as the central, unified entry point for all webhook requests.
     *   **Receives & Parses:** Accepts webhook POST requests from various communication channels (initially WhatsApp/SMS via Twilio) forwarded by API Gateway, then parses the raw event payload (string) into a JSON object (dictionary).
     *   **Validates:** Performs initial validation on the parsed data, and queryies the `ConversationsTable` to confirm message context and conversation state.
-    *   **Routes:** Determines the appropriate next step based on validation and conversation state, queueing the message context to either a channel specific SQS queue or a human handoff SQS queue.
+    *   **Routes:** Determines the appropriate next step based on validation and conversation state, queueing the message context to either a channel specific SQS queue (with delay for batching) or a human handoff SQS queue (no delay).
     *   **Acknowledges:** Returns a response (e.g., HTTP 200 with TwiML) to the webhook provider (like Twilio) to confirm receipt or error, without waiting for downstream processing.
 
-X 2.  **BatchProcessor Lambda (Stage 2):** This function processes messages after a delay, handling batching and critical state management.
-    *   **Receives:** Triggered by SQS messages from the batch queue after the configured delay.
-    *   **Groups:** Aggregates messages received within the batch window for the same conversation.
-    *   **Locks:** Implements a locking mechanism to ensure only one instance processes messages for a specific conversation at a time.
+X 2.  **MessagingLambda (Stage 2):** This function processes messages after a delay, handling batching and critical state management.
+    *   **Receives:** Triggered by SQS messages from the appropriate **Channel Queue** (e.g., `WhatsAppQueue`) after the message-specific delay expires.
+    *   **Groups:** Aggregates messages received within the batch window for the same conversation (by querying the staging table, logic moved here).
+    *   **Locks:** Implements a locking mechanism (`conversations-trigger-lock` table and `conversation_status` field) to ensure only one instance processes messages for a specific conversation at a time.
     *   **Updates:** Persists the batched user messages to the conversation record in DynamoDB.
     *   **Prepares:** Creates a comprehensive context object for further processing (e.g., AI interaction).
     *   **Routes:** Sends the context object to the next stage (e.g., AI processing queue). X
@@ -34,19 +34,19 @@ This design directly addresses critical concurrency scenarios:
 The strategy combines two key mechanisms:
 
 X 1.  **Message Batching via SQS Delay:**
-    *   Incoming messages destined for AI processing are placed onto an SQS queue configured with a `DelaySeconds` parameter (recommended: 10-20 seconds).
-    *   This delay creates a "batching window," allowing messages sent in quick succession by a user to be grouped together before processing begins.
+    *   Trigger messages (containing `conversation_id`) destined for automated processing are placed onto the appropriate **Channel-Specific SQS Queue** (e.g., `WhatsAppQueue`, `SMSQueue`) with a per-message `DelaySeconds` parameter (recommended: 10 seconds).
+    *   This delay creates a "batching window," allowing multiple messages sent in quick succession by a user to be grouped by the `MessagingLambda` before processing begins.
 
 2.  **Conversation Locking via Status Flag:**
-    *   Before the `BatchProcessorLambda` starts processing a batch of messages for a conversation, it attempts to "lock" the corresponding conversation record in DynamoDB.
+    *   Before the `MessagingLambda` starts processing a batch of messages for a conversation (triggered by a message from a Channel Queue), it attempts to "lock" the corresponding conversation record in DynamoDB.
     *   This lock is achieved by using a conditional `UpdateItem` operation to set the `conversation_status` field to `processing_reply`.
     *   The condition ensures the update only succeeds if the status is *not already* `processing_reply`.
-    *   If the lock attempt fails, it means another process holds the lock, and the current batch is requeued.
+    *   If the lock attempt fails, it means another process holds the lock, and the current `MessagingLambda` invocation exits gracefully.
     *   The lock is released (status updated, e.g., to `ai_response_sent`) only after the entire processing cycle for that batch, including sending the reply, is complete. X
 
 ## 3. Detailed Processing Flow
 
-### 3.1 Stage 1: IncomingWebhookHandler Lambda
+### 3.1 Stage 1: StagingLambda
 
 1.  **Reception & Parsing:**
     *   API Gateway triggers the `handler` function with an `event` dictionary.
@@ -191,15 +191,16 @@ X 1.  **Message Batching via SQS Delay:**
         *   **Queueing Error (`QUEUE_ERROR`):** Returns `200 OK` TwiML (Twilio) or standard 500 JSON (Other). *(Assuming queue error is treated as non-transient for now)*.
         *   **Unexpected Code Error:** Returns `200 OK` TwiML (Twilio safety net) or standard 500 JSON (Other).
 
-### 3.2 Stage 2: BatchProcessor Lambda
+### 3.2 Stage 2: MessagingLambda
 
 1.  **Reception & Grouping:**
-    *   Triggered by SQS after the delay, receiving a batch of messages.
-    *   Messages are grouped by `conversation_id`.
+    *   Triggered by SQS after the delay (from a Channel Queue like `WhatsAppQueue`), receiving a message typically containing just the `conversation_id`.
+    *   Queries the `conversations-stage` table to retrieve all related message contexts for that `conversation_id`.
+    *   Messages (contexts) are grouped by `conversation_id` (implicit from the trigger).
 
 2.  **Processing Each Conversation Batch:**
-    *   For each `conversation_id` group:
-        *   Messages are sorted chronologically by original timestamp.
+    *   For the `conversation_id` from the trigger message:
+        *   Retrieved staged messages (contexts) are sorted chronologically by original timestamp.
         *   A unique `batch_id` is generated and associated with these messages.
 
 3.  **Acquire Conversation Lock:**
@@ -227,9 +228,8 @@ X 1.  **Message Batching via SQS Delay:**
 
 ### 4.1 Message Requeuing on Lock Contention
 
-*   When the `BatchProcessorLambda` fails to acquire the lock (Step 3.2.3), it sends the messages *back* to the SQS batch queue they came from.
-*   A longer delay (e.g., +15-30 seconds from the original delay) should be applied.
-*   A `RetryAttempt` message attribute should be used to track retries and prevent infinite loops, eventually sending messages to a Dead-Letter Queue (DLQ) after a configured number of failed attempts.
+*   When the `MessagingLambda` fails to acquire the lock (Step 3.2.3), it should log the contention and **exit successfully**. This acknowledges the SQS trigger message, preventing retries for that specific trigger delivery. The lock mechanism itself prevents duplicate processing.
+*   (The original text described requeuing, which is not the strategy with the trigger lock mechanism we implemented).
 
 ### 4.2 Deadlock Prevention and Recovery
 
@@ -239,9 +239,9 @@ X 1.  **Message Batching via SQS Delay:**
     *   It scans DynamoDB for conversations stuck in `processing_reply` state for longer than a defined threshold (e.g., 5 minutes, longer than max expected processing time).
     *   It resets the status of stalled conversations to a distinct state like `processing_timeout` and logs a warning for investigation. This prevents permanent locks.
 
-### 4.3 Handler Error Response Logic (Stage 1 - `webhook_handler`)
+### 4.3 Handler Error Response Logic (Stage 1 - `StagingLambda`)
 
-The `webhook_handler` Lambda implements specific logic to handle errors detected during parsing or validation, ensuring correct retry behavior for webhook providers like Twilio.
+The `StagingLambda` implements specific logic to handle errors detected during parsing or validation, ensuring correct retry behavior for webhook providers like Twilio.
 
 1.  **Internal Error Reporting:** Functions within the Lambda's modules (e.g., `core/validation.py`) detect specific errors (e.g., conversation not found, transient DB issue) and return a standard dictionary indicating failure, including an `error_code` (e.g., `CONVERSATION_NOT_FOUND`, `DB_TRANSIENT_ERROR`) and a descriptive `message`.
 2.  **Response Builder Suggestion:** The main `handler` function receives this error information. It uses a utility (`utils/response_builder.py`) to translate the `error_code` into a *suggested*, standard HTTP response structure. This builder contains a mapping from internal error codes to default HTTP status codes (e.g., `CONVERSATION_NOT_FOUND` -> 404, `DB_TRANSIENT_ERROR` -> 503) and formats a standard JSON error body.
@@ -275,9 +275,9 @@ This approach ensures that only explicitly identified transient infrastructure i
 sequenceDiagram
     participant Twilio
     participant APIGW as API Gateway
-    participant Lambda1 as IncomingWebhookHandler
-    participant SQSBatch as SQS Batch Queue
-    participant Lambda2 as BatchProcessor
+    participant Lambda1 as StagingLambda
+    participant SQSChannel as Channel Queue (e.g., WhatsAppQueue)
+    participant Lambda2 as MessagingLambda
     participant DynamoDB
     participant Downstream as Downstream Processing (AI, Sender)
 
@@ -285,7 +285,7 @@ sequenceDiagram
     APIGW->>+Lambda1: Trigger Event
     Lambda1->>+DynamoDB: Query Conversation (Check Status)
     DynamoDB-->>-Lambda1: Conversation (Status != 'processing')
-    Lambda1->>+SQSBatch: SendMessage (Msg1 Context w/ Delay)
+    Lambda1->>+SQSChannel: SendMessage (Trigger Msg w/ Delay=W)
     Lambda1-->>-APIGW: HTTP 200 (TwiML)
     APIGW-->>-Twilio: HTTP 200
 
@@ -299,34 +299,36 @@ sequenceDiagram
     APIGW-->>-Twilio: HTTP 200
 
     %% Batch Processing after Delay %%
-    SQSBatch->>+Lambda2: Trigger Event (Batch w/ Msg1 Context)
+    SQSChannel->>+Lambda2: Trigger Event (Trigger Msg w/ ConvID)
     Lambda2->>+DynamoDB: Attempt Lock (Conditional Update: Set Status='processing')
     DynamoDB-->>-Lambda2: Lock Acquired (Update OK)
-    Lambda2->>DynamoDB: Update Conversation (Append Msg1, Status remains 'processing')
+    Lambda2->>DynamoDB: Query conversations-stage, Merge Batch
+    Lambda2->>DynamoDB: Update Conversation (Append Msg Batch, Status remains 'processing')
     DynamoDB-->>Lambda2: Update OK
     Lambda2->>+Downstream: Route Full Context for Processing
     Downstream->>Downstream: AI Interaction, Reply Sending...
     Downstream->>+DynamoDB: Unlock Conversation (Set Status='ai_response_sent')
     DynamoDB-->>-Downstream: Unlock OK
     Downstream-->>-Lambda2: (Processing Complete)
-    Lambda2-->>-SQSBatch: (Message Processed)
+    Lambda2-->>-SQSChannel: (Message Processed)
 
 
     %% Lock Contention Scenario %%
-    SQSBatch->>+Lambda2: Trigger Event (Batch w/ MsgX Context)
+    SQSChannel->>+Lambda2: Trigger Event (Trigger Msg w/ ConvID)
     Lambda2->>+DynamoDB: Attempt Lock (Conditional Update: Set Status='processing')
     DynamoDB-->>-Lambda2: Lock Failed (ConditionalCheckFailedException)
-    Lambda2->>+SQSBatch: SendMessage (Requeue MsgX Context w/ Longer Delay & RetryAttr)
-    Lambda2-->>-SQSBatch: (Message Requeued)
+    Lambda2->>Lambda2: Log contention, Exit Successfully
+    Lambda2-->>-SQSChannel: (Message Acknowledged)
 ```
 
 ## 8. Potential Considerations
 
 ### 8.1 Batching Implementation
-1. Use standard SQS queues (not FIFO) with `conversation_id` as a message attribute.
-2. Inside the BatchProcessor Lambda, group `event.Records` by `conversation_id`.
-3. Sort each group of messages by original timestamp to preserve order.
-4. Perform a single DynamoDB `UpdateItem` call per conversation batch to append messages and update timestamps.
+1. `StagingLambda` sends trigger message (`{conversation_id}`) to appropriate Channel Queue with `DelaySeconds=W`.
+2. `MessagingLambda` is triggered by a single message from the Channel Queue.
+3. `MessagingLambda` queries `conversations-stage` table for all messages for that `conversation_id`.
+4. Sort each group of messages by original timestamp to preserve order.
+5. Perform a single DynamoDB `UpdateItem` call per conversation batch to append messages and update timestamps.
 
 ### 8.2 Lock Timeout Handling
 - If processing fails while `conversation_status` is `processing_reply`, records can remain locked indefinitely.
@@ -346,7 +348,7 @@ sequenceDiagram
 To prevent processing the same message twice (e.g., due to Lambda timeouts or Twilio retries), implement the following strategies:
 
 1. Use the Twilio `MessageSid` as a deduplication key in each message context.
-2. **Consumer-side check**: In the BatchProcessor Lambda (or in the DynamoDB update logic), verify whether `MessageSid` already exists in the conversation's `messages` list before appending:
+2. **Consumer-side check**: In the `MessagingLambda` (or downstream), verify whether `MessageSid` already exists in the conversation's `messages` list before appending:
    - Query the conversation record for existing message IDs.
    - If `MessageSid` is found, skip processing this message and log a `DuplicateMessageDetected` event.
 3. **Conditional DynamoDB write**: Use a conditional update expression to append only if no existing item has the same `MessageSid`, e.g.:  
@@ -377,11 +379,11 @@ These measures ensure idempotent processing even if Twilio retries the webhook o
 ### 10.2 X-Ray Tracing
 - Enable **Active Tracing** on both Lambdas to correlate end-to-end traces:
   ```yaml
-  IncomingWebhookHandler:
+  StagingLambda:
     Properties:
       TracingConfig:
         Mode: Active
-  BatchProcessorLambda:
+  MessagingLambda:
     Properties:
       TracingConfig:
         Mode: Active
@@ -393,7 +395,7 @@ These measures ensure idempotent processing even if Twilio retries the webhook o
   * **Errors**: count of function errors
   * **Duration**: execution time
   * **Throttles**: if concurrency limits are hit
-  * **IteratorAge** (for BatchProcessor SQS trigger) shows message delay in the queue
+  * **IteratorAge** (for `MessagingLambda` SQS trigger) shows message delay in the queue
 - Define **Metric Filters** on Lambda logs for custom events (e.g. `DuplicateMessageDetected`, `LockContention`).
 - Create **Alarms** for critical conditions:
   * Lambda Errors > 1% of invocations over 5 minutes
@@ -403,7 +405,7 @@ These measures ensure idempotent processing even if Twilio retries the webhook o
 
 ## 11. Deployment
 
-When deploying both the IncomingWebhookHandler and BatchProcessor Lambdas, follow the same SAM CLI workflow used for the API Gateway:
+When deploying both the StagingLambda and MessagingLambda Lambdas, follow the same SAM CLI workflow used for the API Gateway:
 
 ### 11.1 Prerequisites
 - AWS CLI configured with the target account credentials
@@ -447,4 +449,4 @@ sam deploy \
 ### 11.4 Post-Deployment Manual Steps
 - Populate AWS Secrets Manager with Twilio credentials under `/replies-engine/${EnvironmentName}/twilio`.
 - Associate any required environment variables or config in the deployed Lambda via the SAM parameters.
-- Validate that the `IncomingWebhookHandler` Lambda has the correct AWS IAM role permissions (DynamoDB, SQS, Secrets Manager, CloudWatch).
+- Validate that the `StagingLambda` Lambda has the correct AWS IAM role permissions (DynamoDB, SQS, Secrets Manager, CloudWatch).

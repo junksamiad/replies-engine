@@ -6,14 +6,14 @@ This document details the low-level design for the `messaging_lambda` function (
 
 ## 2. Context within Flow & Trigger
 
-*   **Trigger:** AWS SQS (Standard Queue - The "SQS Trigger Delay Queue" mentioned in the overall flow).
-*   **Triggering Event:** A single JSON message becomes visible on the SQS queue after its `DelaySeconds` (set by the `webhook_handler`) expires. The message contains `{ "conversation_id": "..." }`.
+*   **Trigger:** AWS SQS (Standard Queue - e.g., `WhatsAppQueue`, `SMSQueue`, `EmailQueue` as configured in `sqs_queues_lld.md`).
+*   **Triggering Event:** A single JSON message becomes visible on the SQS queue after its message-specific `DelaySeconds` (set by the `StagingLambda`) expires. The message contains `{ "conversation_id": "..." }`.
 *   **Preceding Steps:**
-    *   `webhook_handler` Lambda (Stage 1) has successfully validated one or more incoming messages for a conversation.
+    *   `StagingLambda` (Stage 1) has successfully validated one or more incoming messages for a conversation.
     *   The context for each message has been written to the `conversations-stage` DynamoDB table.
     *   A lock entry has been successfully placed in the `conversations-trigger-lock` DynamoDB table (with TTL) by the *first* message handler for the batch window.
-    *   The trigger message has been sent to the SQS Delay Queue by that first handler.
-    *   The SQS delay (`W` seconds) has elapsed.
+    *   The trigger message has been sent to the appropriate **Channel Queue** (e.g., `WhatsAppQueue`) with `DelaySeconds=W` by that first handler.
+    *   The SQS message delay (`W` seconds) has elapsed.
 
 ## 3. Detailed Processing Steps (`messaging_lambda`)
 
@@ -51,7 +51,7 @@ This document details the low-level design for the `messaging_lambda` function (
     *   **Details:** Set the `conversation_status` back to an appropriate idle state (e.g., `'queued_for_ai'`, `'awaiting_agent'`, depending on the `target_queue_url`). Update `last_processed_at` timestamp if applicable.
 10. **Lambda Success:**
     *   **Action:** Return success from the Lambda handler function.
-    *   **Outcome:** SQS automatically deletes the processed trigger message from the SQS Delay Queue.
+    *   **Outcome:** SQS automatically deletes the processed trigger message from the **Channel Queue** (e.g., `WhatsAppQueue`).
 
 ## 4. Error Handling Considerations
 
