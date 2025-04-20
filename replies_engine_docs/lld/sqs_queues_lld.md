@@ -4,127 +4,163 @@
 
 The SQS queues in the replies-engine microservice serve as message brokers between different processing stages. They provide:
 
-- Decoupling of the webhook reception from message processing
-- Buffering of messages to handle traffic spikes
-- Delayed processing to enable message batching
-- Dead-letter handling for fault tolerance
-- Separate paths for human handoff vs. AI processing
+- Decoupling of the initial webhook reception (`StagingLambda`) from delayed batch processing (`MessagingLambda`).
+- Buffering of trigger messages and processed payloads.
+- Delayed processing initiation via a dedicated Trigger Delay Queue to enable message batching.
+- Dead-letter handling for fault tolerance on trigger and channel-specific queues.
+- Separate paths for human handoff vs. automated/AI processing.
 
-This LLD focuses on two primary queues:
-1. **WhatsApp Replies Queue** - For messages to be processed by the AI
-2. **Human Handoff Queue** - For messages to be handled by human operators
+This LLD outlines the configurations for the following queues:
+1.  **Trigger Delay Queue:** Initiates batch processing after a delay.
+2.  **Channel-Specific Queues (WhatsApp, SMS, Email):** Receive merged payloads for downstream processing (e.g., AI).
+3.  **Human Handoff Queue:** Receives merged payloads flagged for manual review.
 
 ## 2. Queue Configurations
 
-### 2.1 WhatsApp Replies Queue
+*Note: `${ProjectPrefix}` (e.g., `ai-multi-comms`) and `${EnvironmentName}` (e.g., `dev`, `prod`) will be substituted during deployment.*
+
+### 2.1 Trigger Delay Queue
+
+This queue receives simple trigger messages from the `StagingLambda` and invokes the `MessagingLambda` after a defined delay.
 
 ```yaml
-WhatsAppRepliesQueue:
+TriggerDelayQueue:
   Type: AWS::SQS::Queue
   Properties:
-    QueueName: !Sub '${ProjectPrefix}-whatsapp-replies-queue-${EnvironmentName}'
-    DelaySeconds: 30  # 30-second delay for message batching
-    VisibilityTimeout: 905  # Slightly higher than Lambda timeout (900s)
-    MessageRetentionPeriod: 345600  # 4 days (in seconds)
+    QueueName: !Sub '${ProjectPrefix}-trigger-delay-queue-${EnvironmentName}'
+    DelaySeconds: 0 # Default delay is 0; Delay is set per-message by StagingLambda
+    VisibilityTimeout: 905 # Slightly higher than MessagingLambda timeout (900s assumed)
+    MessageRetentionPeriod: 345600 # 4 days (in seconds)
     RedrivePolicy:
-      deadLetterTargetArn: !GetAtt WhatsAppRepliesDLQ.Arn
-      maxReceiveCount: 3  # Retry failed processing 3 times before moving to DLQ
+      deadLetterTargetArn: !GetAtt TriggerDelayDLQ.Arn
+      maxReceiveCount: 3 # Retry trigger 3 times before moving to DLQ
 ```
 
 #### Configuration Rationale
 
-- **DelaySeconds (30s)**: Provides a delay window to allow multiple messages from the same user to arrive before processing begins. This enables more contextual AI responses when a user sends multiple messages in quick succession.
-- **VisibilityTimeout (905s)**: Set higher than the Lambda function timeout (900s) to prevent duplicate processing if the Lambda takes the maximum allowed time.
-- **MessageRetentionPeriod (4 days)**: Provides enough time for operational recovery if there are issues with message processing, without keeping messages indefinitely.
-- **maxReceiveCount (3)**: Allows multiple processing attempts before considering a message unprocessable.
+-   **DelaySeconds (0 default):** The actual batching delay (`W`, e.g., 10s) is set dynamically via the `DelaySeconds` parameter in the `SendMessage` call made by the `StagingLambda`.
+-   **VisibilityTimeout (905s):** Set higher than the `MessagingLambda` function timeout (assumed 900s) to prevent duplicate processing of the *same trigger* if the Lambda takes the maximum allowed time.
+-   **MessageRetentionPeriod (4 days):** Standard retention for operational recovery.
+-   **maxReceiveCount (3):** Allows multiple trigger attempts before considering it unprocessable.
 
-### 2.2 WhatsApp Replies Dead-Letter Queue (DLQ)
+### 2.2 Trigger Delay Dead-Letter Queue (DLQ)
 
 ```yaml
-WhatsAppRepliesDLQ:
+TriggerDelayDLQ:
   Type: AWS::SQS::Queue
   Properties:
-    QueueName: !Sub '${ProjectPrefix}-whatsapp-replies-dlq-${EnvironmentName}'
-    MessageRetentionPeriod: 1209600  # 14 days (in seconds)
+    QueueName: !Sub '${ProjectPrefix}-trigger-delay-dlq-${EnvironmentName}'
+    MessageRetentionPeriod: 1209600 # 14 days (in seconds)
 ```
 
 #### Configuration Rationale
 
-- **MessageRetentionPeriod (14 days)**: Longer retention period for failed messages to allow sufficient time for investigation and manual reprocessing.
+-   **MessageRetentionPeriod (14 days):** Longer retention for failed trigger messages to allow sufficient time for investigation.
 
-### 2.3 Human Handoff Queue
+### 2.3 WhatsApp Target Queue
+
+Receives merged payloads processed by `MessagingLambda` destined for WhatsApp channel handling (e.g., AI interaction).
+
+```yaml
+WhatsAppTargetQueue:
+  Type: AWS::SQS::Queue
+  Properties:
+    QueueName: !Sub '${ProjectPrefix}-whatsapp-target-queue-${EnvironmentName}'
+    DelaySeconds: 0 # No delay needed; batching handled by TriggerDelayQueue
+    VisibilityTimeout: 300 # Example: Depends on consumer processing time (e.g., AI Lambda)
+    MessageRetentionPeriod: 345600 # 4 days (in seconds)
+    RedrivePolicy:
+      deadLetterTargetArn: !GetAtt WhatsAppTargetDLQ.Arn
+      maxReceiveCount: 3
+```
+
+### 2.4 WhatsApp Target Dead-Letter Queue (DLQ)
+
+```yaml
+WhatsAppTargetDLQ:
+  Type: AWS::SQS::Queue
+  Properties:
+    QueueName: !Sub '${ProjectPrefix}-whatsapp-target-dlq-${EnvironmentName}'
+    MessageRetentionPeriod: 1209600 # 14 days (in seconds)
+```
+
+### 2.5 SMS Target Queue & DLQ
+
+Similar configuration to WhatsApp Target Queue & DLQ, adjusted for SMS consumers.
+
+```yaml
+# Placeholder - Define SMSTargetQueue similar to WhatsAppTargetQueue
+# Placeholder - Define SMSTargetDLQ similar to WhatsAppTargetDLQ
+```
+
+### 2.6 Email Target Queue & DLQ
+
+Similar configuration to WhatsApp Target Queue & DLQ, adjusted for Email consumers.
+
+```yaml
+# Placeholder - Define EmailTargetQueue similar to WhatsAppTargetQueue
+# Placeholder - Define EmailTargetDLQ similar to WhatsAppTargetDLQ
+```
+
+### 2.7 Human Handoff Queue
+
+Receives merged payloads processed by `MessagingLambda` flagged for human intervention.
 
 ```yaml
 HumanHandoffQueue:
   Type: AWS::SQS::Queue
   Properties:
     QueueName: !Sub '${ProjectPrefix}-human-handoff-queue-${EnvironmentName}'
-    DelaySeconds: 0  # No delay for human intervention
-    VisibilityTimeout: 300  # 5 minutes (in seconds)
-    MessageRetentionPeriod: 345600  # 4 days (in seconds)
-    RedrivePolicy:
-      deadLetterTargetArn: !GetAtt HumanHandoffDLQ.Arn
-      maxReceiveCount: 3
+    DelaySeconds: 0 # No delay for human intervention
+    VisibilityTimeout: 3600 # Example: 1 hour visibility for manual action
+    MessageRetentionPeriod: 604800 # 7 days (in seconds) - Longer retention suitable for manual queues
+    # No RedrivePolicy - This queue acts as its own holding area for manual action.
 ```
 
 #### Configuration Rationale
 
-- **DelaySeconds (0)**: No delay for human handoff messages to ensure immediate attention.
-- **VisibilityTimeout (300s)**: Shorter timeout as human handoff processing is typically quicker than AI processing.
-- **MessageRetentionPeriod (4 days)**: Consistent with the WhatsApp Replies Queue.
-
-### 2.4 Human Handoff Dead-Letter Queue (DLQ)
-
-```yaml
-HumanHandoffDLQ:
-  Type: AWS::SQS::Queue
-  Properties:
-    QueueName: !Sub '${ProjectPrefix}-human-handoff-dlq-${EnvironmentName}'
-    MessageRetentionPeriod: 1209600  # 14 days (in seconds)
-```
+-   **DelaySeconds (0):** Ensure immediate availability for human operators.
+-   **VisibilityTimeout (e.g., 3600s):** Longer timeout appropriate for potential manual review and action window.
+-   **MessageRetentionPeriod (e.g., 7 days):** Longer retention suitable for items awaiting manual action.
+-   **No RedrivePolicy:** Messages remain here until explicitly processed and deleted by the human interface/operator. If processing fails persistently at the *human* step, it's an operational issue, not a message routing issue suitable for a DLQ. Monitoring queue depth is crucial.
 
 ## 3. Message Format and Schema
 
-### 3.1 Message Schema for WhatsApp Replies Queue
+### 3.1 Message Schema for Trigger Delay Queue
+
+A simple JSON object containing only the `conversation_id`.
 
 ```json
 {
-  "twilio_message": {
-    "Body": ["User message text"],
-    "From": ["whatsapp:+1234567890"],
-    "To": ["whatsapp:+0987654321"],
-    "SmsMessageSid": ["SM..."],
-    "MessageSid": ["SM..."],
-    "AccountSid": ["AC..."],
-    "NumMedia": ["0"],
-    "NumSegments": ["1"],
-    "SmsStatus": ["received"],
-    "ApiVersion": ["2010-04-01"]
-    // ... other Twilio webhook parameters
-  },
-  "conversation_id": "abc123def456",
-  "thread_id": "thread_abc123def456",
-  "company_id": "company_123",
-  "project_id": "project_456",
-  "timestamp": "2023-07-21T14:30:45.123Z",
-  "channel": "whatsapp"
+  "conversation_id": "abc123def456"
 }
 ```
 
-### 3.2 Message Schema for Human Handoff Queue
+### 3.2 Message Schema for Target Queues (WhatsApp, SMS, Email, Human Handoff)
+
+A JSON object representing the *merged* payload produced by the `MessagingLambda`. The exact structure depends on downstream needs, but a likely format is:
 
 ```json
 {
-  "twilio_message": {
-    // Same format as WhatsApp Replies Queue
-  },
   "conversation_id": "abc123def456",
-  "thread_id": "thread_abc123def456",
-  "company_id": "company_123",
-  "project_id": "project_456",
-  "timestamp": "2023-07-21T14:30:45.123Z",
-  "channel": "whatsapp",
-  "handoff_reason": "user_requested" // Optional field indicating why handoff occurred
+  "merged_body": "User message part 1.\nUser message part 2.",
+  "channel_type": "whatsapp", // or sms, email
+  "sender_id": "whatsapp:+1234567890", // e.g., from first message context
+  "recipient_id": "whatsapp:+0987654321", // e.g., from first message context
+  "first_message_received_at": "2023-07-21T14:30:45.123Z", // Timestamp of first msg in batch
+  "last_message_received_at": "2023-07-21T14:30:52.456Z", // Timestamp of last msg in batch
+  "message_sids": ["SM...", "SM..."], // List of original SIDs in the batch
+  "handoff_reason": null, // or "user_requested", "auto_queued", etc. for Handoff Queue
+  "full_conversation_context": {
+      // Relevant fields retrieved from ConversationsTable by StagingLambda
+      // and included in the context_object stored in conversations-stage
+      "project_id": "project_456",
+      "company_id": "company_123",
+      "thread_id": "thread_abc123def456",
+      "customer_name": "...",
+      "current_step": "...",
+      // etc.
+  }
 }
 ```
 
@@ -132,100 +168,116 @@ HumanHandoffDLQ:
 
 ### 4.1 Send Operations
 
-| Component | Operation | Queue |
-|-----------|-----------|-------|
-| IncomingWebhookHandler Lambda | SendMessage | WhatsApp Replies Queue or Human Handoff Queue (based on handoff_to_human flag) |
-| Manual Reprocessing Tool (future) | SendMessage | WhatsApp Replies Queue (for retrying failed messages) |
+| Component | Operation | Queue | Notes |
+|-----------|-----------|-------|-------|
+| `StagingLambda` | SendMessage | Trigger Delay Queue | Sends trigger message (`{ "conversation_id": "..." }`) with dynamic `DelaySeconds=W` if lock acquired. |
+| `MessagingLambda` | SendMessage | WhatsApp/SMS/Email Target Queue OR Human Handoff Queue | Sends merged payload after successful batch processing. |
+| Manual Reprocessing Tool (future) | SendMessage | Trigger Delay Queue (for failed triggers) or Target Queues (for failed processing) | For retrying failed messages/batches. |
 
 ### 4.2 Receive Operations
 
-| Component | Operation | Queue |
-|-----------|-----------|-------|
-| ReplyProcessorLambda | ReceiveMessage | WhatsApp Replies Queue |
-| Human Interface (future) | ReceiveMessage | Human Handoff Queue |
+| Component | Operation | Queue | Notes |
+|-----------|-----------|-------|-------|
+| `MessagingLambda` | ReceiveMessage | Trigger Delay Queue | Receives single trigger message to initiate batch processing. |
+| AI Processor Lambda (future) | ReceiveMessage | WhatsApp/SMS/Email Target Queues | Consumes merged payloads for AI interaction. |
+| Human Interface (future) | ReceiveMessage | Human Handoff Queue | Consumes merged payloads requiring manual action. |
 
 ## 5. Message Lifecycle
 
-### 5.1 WhatsApp Replies Queue Lifecycle
+### 5.1 Trigger Delay Queue Lifecycle
 
-1. **Creation**: Message created by IncomingWebhookHandler Lambda
-2. **Delay Period**: Message becomes invisible for 30 seconds (DelaySeconds)
-3. **Available**: Message becomes available for processing
-4. **In Flight**: Message is retrieved by ReplyProcessorLambda and becomes invisible for VisibilityTimeout duration
-5. **Processing Outcomes**:
-   - **Success**: Message is deleted from the queue after successful processing
-   - **Failure**: Message returns to the queue after VisibilityTimeout expires
-   - **Repeated Failure**: After maxReceiveCount failures, message moves to DLQ
+1.  **Creation**: Simple trigger message created by `StagingLambda`, sent with `DelaySeconds=W`.
+2.  **Delay Period**: Message becomes invisible for `W` seconds.
+3.  **Available**: Message becomes available for processing.
+4.  **In Flight**: Message is retrieved by `MessagingLambda` and becomes invisible for `VisibilityTimeout`.
+5.  **Processing Outcomes**:
+    *   **Success**: `MessagingLambda` completes successfully, message is deleted from the queue.
+    *   **Failure (MessagingLambda crash/timeout)**: Message returns to the queue after `VisibilityTimeout` expires.
+    *   **Failure (Lock Contention in MessagingLambda)**: `MessagingLambda` exits successfully (returns success to SQS), message is deleted (preventing trigger retry for *this specific* SQS message delivery).
+    *   **Repeated Failure (Non-Contention)**: After `maxReceiveCount` failures, message moves to `TriggerDelayDLQ`.
 
-### 5.2 Human Handoff Queue Lifecycle
+### 5.2 Target Queue Lifecycle (WhatsApp, SMS, Email)
 
-1. **Creation**: Message created by IncomingWebhookHandler Lambda
-2. **Available**: Message immediately available for processing (no delay)
-3. **In Flight**: Message is retrieved by Human Interface System and becomes invisible for VisibilityTimeout duration
-4. **Processing Outcomes**:
-   - **Success**: Message is deleted from the queue after successful processing
-   - **Failure**: Similar to WhatsApp Replies Queue
+1.  **Creation**: Merged payload message created by `MessagingLambda`.
+2.  **Available**: Message immediately available for processing (no delay).
+3.  **In Flight**: Message is retrieved by consumer (e.g., AI Lambda) and becomes invisible for `VisibilityTimeout`.
+4.  **Processing Outcomes**:
+    *   **Success**: Message is deleted from the queue after successful processing by consumer.
+    *   **Failure**: Message returns to the queue after `VisibilityTimeout` expires.
+    *   **Repeated Failure**: After `maxReceiveCount` failures, message moves to the respective Target DLQ.
+
+### 5.3 Human Handoff Queue Lifecycle
+
+1.  **Creation**: Merged payload message created by `MessagingLambda`.
+2.  **Available**: Message immediately available for processing (no delay).
+3.  **In Flight**: Message is retrieved by Human Interface System and becomes invisible for `VisibilityTimeout`.
+4.  **Processing Outcomes**:
+    *   **Success**: Message is deleted from the queue after successful processing/action by human/system.
+    *   **Failure**: Message returns to the queue after `VisibilityTimeout` expires. It remains in the queue until successfully processed or it expires after `MessageRetentionPeriod`. Monitoring queue depth is essential.
 
 ## 6. Error Handling & Dead Letter Queues
 
 ### 6.1 Dead Letter Queue Strategy
 
-- Messages are sent to the DLQ after 3 failed processing attempts
-- DLQs retain messages for 14 days to allow time for investigation
-- DLQ monitoring with CloudWatch alarms will trigger notifications
+-   Messages are sent to the appropriate DLQ (Trigger or Target) after 3 failed processing attempts.
+-   DLQs retain messages for 14 days.
+-   The Human Handoff queue does not have a DLQ; monitoring its depth (`ApproximateNumberOfMessagesVisible`) is key.
+-   DLQ monitoring with CloudWatch alarms will trigger notifications.
 
 ### 6.2 DLQ Handling Process
 
-1. Operations team receives alert about messages in DLQ
-2. Messages are examined to determine cause of failure
-3. After issue resolution, messages can be manually moved back to the primary queue for reprocessing
-4. Metrics are collected for failure analysis and system improvement
+1.  Operations team receives alert about messages in a DLQ.
+2.  Messages are examined to determine the cause of failure.
+3.  After issue resolution, messages can be manually moved back to the primary queue (Trigger or Target) for reprocessing.
+4.  Metrics are collected for failure analysis and system improvement.
 
 ## 7. Performance Considerations
 
 ### 7.1 Throughput
 
-- Default SQS throughput (unlimited messages per second) is sufficient for expected load
-- No need for throughput provisioning initially
+-   Default SQS throughput (unlimited messages per second) is sufficient for expected load.
 
 ### 7.2 Latency
 
-- Standard queue (non-FIFO) used as exact ordering is not critical
-- 30-second delay introduces intentional latency for message batching benefits
-- Expected end-to-end latency for happy path: ~35-40 seconds (30s delay + ~5-10s processing)
+-   Standard queues (non-FIFO) used as exact ordering across different conversations is not critical (within-conversation order is handled by `MessagingLambda` sorting).
+-   The Trigger Delay Queue introduces an intentional latency of `W` seconds (e.g., 10s) for batching.
+-   Expected end-to-end latency for happy path to *target queue*: `W` seconds + `MessagingLambda` processing time (~10-15 seconds typical). Latency to final reply depends on downstream consumers.
 
 ### 7.3 Batch Processing
 
-- SQS batching features (SendMessageBatch, ReceiveMessage with MaxNumberOfMessages) should be used for efficiency
-- ReplyProcessorLambda will be configured with batch size of 1 initially (can be increased if needed)
+-   Batching of *incoming* messages is achieved via the Trigger Delay mechanism.
+-   The `MessagingLambda` is triggered by a *single* SQS message but processes a *batch* of items queried from the `conversations-stage` DynamoDB table.
+-   Consumers of the *Target* Queues (WhatsApp, SMS, Email) *can* use SQS batching features (`ReceiveMessage` with `MaxNumberOfMessages` > 1) if beneficial for their processing logic.
 
 ## 8. Monitoring & Alerting
 
 ### 8.1 Key Metrics to Monitor
 
-| Metric | Description | Threshold | Alert |
-|--------|-------------|-----------|-------|
-| ApproximateNumberOfMessagesVisible | Number of messages available for retrieval | > 100 for > 5 minutes | Warning |
-| ApproximateNumberOfMessagesNotVisible | Number of messages in flight | > 50 for > 10 minutes | Warning |
-| ApproximateAgeOfOldestMessage | Age of the oldest message in the queue | > 1 hour | Warning |
-| NumberOfMessagesReceived | Message arrival rate | N/A | No alert (monitoring only) |
-| NumberOfMessagesSent | Message dispatch rate | N/A | No alert (monitoring only) |
-| NumberOfMessagesDeleted | Message completion rate | N/A | No alert (monitoring only) |
-| ApproximateNumberOfMessagesVisible (DLQ) | Messages in DLQ | > 0 | Critical |
+*(Monitor these for Trigger Queue, each Target Queue, and Human Handoff Queue)*
+
+| Metric                            | Description                               | Threshold Example                      | Alert Example |
+| :-------------------------------- | :---------------------------------------- | :------------------------------------- | :------------ |
+| ApproximateNumberOfMessagesVisible | Messages available for retrieval          | > 100 for > 5 minutes                  | Warning       |
+| ApproximateNumberOfMessagesNotVisible | Messages in flight (being processed)    | > 50 for > 10 minutes                  | Warning       |
+| ApproximateAgeOfOldestMessage     | Age of the oldest message in the queue  | > 1 hour (Target/Handoff), >10m (Trigger) | Warning       |
+| ApproximateNumberOfMessagesVisible (DLQ) | Messages in any DLQ                    | > 0                                    | Critical      |
+| ApproximateNumberOfMessagesVisible (Handoff) | Messages in Human Handoff Queue     | > 50 (adjust based on team capacity) | Warning       |
 
 ### 8.2 CloudWatch Alarms
 
+Define CloudWatch Alarms for DLQNotEmpty conditions (for Trigger and Target DLQs) and high queue depth/age for the Human Handoff Queue. Example for Trigger DLQ:
+
 ```yaml
-WhatsAppRepliesDLQNotEmptyAlarm:
+TriggerDelayDLQNotEmptyAlarm:
   Type: AWS::CloudWatch::Alarm
   Properties:
-    AlarmName: !Sub '${ProjectPrefix}-WhatsAppRepliesDLQ-NotEmpty-${EnvironmentName}'
-    AlarmDescription: 'Alarm when any messages appear in the WhatsApp Replies Dead Letter Queue'
+    AlarmName: !Sub '${ProjectPrefix}-TriggerDelayDLQ-NotEmpty-${EnvironmentName}'
+    AlarmDescription: 'Alarm when any messages appear in the Trigger Delay Dead Letter Queue'
     Namespace: 'AWS/SQS'
     MetricName: 'ApproximateNumberOfMessagesVisible'
     Dimensions:
       - Name: QueueName
-        Value: !GetAtt WhatsAppRepliesDLQ.QueueName
+        Value: !GetAtt TriggerDelayDLQ.QueueName
     Statistic: Sum
     Period: 60
     EvaluationPeriods: 1
@@ -233,206 +285,203 @@ WhatsAppRepliesDLQNotEmptyAlarm:
     ComparisonOperator: GreaterThan
     TreatMissingData: notBreaching
     AlarmActions:
-      - !Ref AlertsNotificationTopic
+      - !Ref AlertsNotificationTopic # Assumes an SNS topic parameter/resource
 ```
+
+*(Define similar alarms for Target DLQs and the Human Handoff queue depth/age)*
 
 ## 9. Security Considerations
 
-### 9.1 Encryption
-
-- Server-side encryption (SSE) will be enabled for all queues
-- AWS managed KMS keys will be used for encryption
+*(Content from original section 9 generally remains valid - apply SSE, least privilege IAM, data protection policies)*
 
 ```yaml
-WhatsAppRepliesQueue:
+# Example SSE enablement
+TriggerDelayQueue:
   Type: AWS::SQS::Queue
   Properties:
     # ...existing properties
     SqsManagedSseEnabled: true
+# Apply SqsManagedSseEnabled: true to ALL queues including DLQs
 ```
-
-### 9.2 Access Control
-
-- IAM roles with least privilege principle
-- SQS access policies restricting queue operations to specific IAM roles
-- No public access to queues
-
-### 9.3 Data Protection
-
-- Messages containing sensitive information should be minimal
-- Personal identifiable information (PII) should be handled according to data protection policies
-- Consider message content masking in logs
 
 ## 10. Implementation and Testing Strategy
 
-### 10.1 Manual Implementation Steps
+*(General approach remains valid, update commands/tests for new queues)*
+
+### 10.1 Manual Implementation Steps (Example for Trigger Queue)
 
 ```bash
-# Create WhatsApp Replies DLQ
-aws sqs create-queue \
-  --queue-name ai-multi-comms-whatsapp-replies-dlq-dev \
-  --attributes '{"MessageRetentionPeriod":"1209600"}'
+# Create Trigger Delay DLQ
+aws sqs create-queue --queue-name ${ProjectPrefix}-trigger-delay-dlq-${EnvironmentName} --attributes '{"MessageRetentionPeriod":"1209600","SqsManagedSseEnabled":"true"}'
 
 # Get the DLQ ARN
-dlq_arn=$(aws sqs get-queue-attributes \
-  --queue-url https://sqs.us-east-1.amazonaws.com/{account-id}/ai-multi-comms-whatsapp-replies-dlq-dev \
-  --attribute-names QueueArn \
-  --query 'Attributes.QueueArn' \
-  --output text)
+dlq_arn=$(aws sqs get-queue-attributes --queue-url .../${ProjectPrefix}-trigger-delay-dlq-${EnvironmentName} --attribute-names QueueArn --query 'Attributes.QueueArn' --output text)
 
-# Create WhatsApp Replies Queue with DLQ
-aws sqs create-queue \
-  --queue-name ai-multi-comms-whatsapp-replies-queue-dev \
-  --attributes '{"DelaySeconds":"30","VisibilityTimeout":"905","MessageRetentionPeriod":"345600","RedrivePolicy":"{\"deadLetterTargetArn\":\"'$dlq_arn'\",\"maxReceiveCount\":\"3\"}"}'
+# Create Trigger Delay Queue with DLQ
+aws sqs create-queue --queue-name ${ProjectPrefix}-trigger-delay-queue-${EnvironmentName} --attributes '{"DelaySeconds":"0","VisibilityTimeout":"905","MessageRetentionPeriod":"345600","RedrivePolicy":"{\"deadLetterTargetArn\":\"'$dlq_arn'\",\"maxReceiveCount\":\"3\"}","SqsManagedSseEnabled":"true"}'
 
-# Similar commands for Human Handoff Queue and DLQ
+# Similar commands for Target Queues/DLQs and Handoff Queue
 ```
 
 ### 10.2 Testing Approach
 
 #### Unit Testing
 
-- Test SQS service wrapper functions with mocked SQS client
-- Verify correct message formatting and queue URL selection
+-   Test SQS service wrapper functions in `StagingLambda` and `MessagingLambda` with mocked SQS client.
+-   Verify correct trigger message format, dynamic delay setting, merged payload format, and target queue URL selection.
 
 #### Integration Testing
 
-- Use localstack for local SQS emulation
-- Test message flow from IncomingWebhookHandler to SQS to ReplyProcessorLambda
-- Verify message format and content
-- Test error handling and DLQ functionality
-
-#### Performance Testing
-
-- Simulate high message volume to validate throughput
-- Verify batching behavior with multiple messages
-
-### 10.3 Validation Checks
-
-- Verify message delivery to correct queue based on handoff flag
-- Confirm DelaySeconds behavior for message batching
-- Test message visibility and processing timeout
-- Validate DLQ redrive policy by forcing failures
+-   Use localstack for local SQS/DynamoDB/Lambda emulation.
+-   Test the full flow: `StagingLambda` -> Trigger Queue (with delay) -> `MessagingLambda` -> Target/Handoff Queue.
+-   Verify message content at each stage.
+-   Test error handling (lock contention, processing errors) and DLQ/Handoff queue behavior.
 
 ## 11. Deployment Strategy
 
-### 11.1 Initial Deployment
-
-- Deploy queues via AWS CLI commands as outlined above
-- Document queue URLs and ARNs for Lambda environment variables
-- Configure IAM permissions for Lambda functions
-
-### 11.2 Future SAM Template
-
-In the future SAM template, the following resources will be defined:
+### 11.1 Future SAM Template Snippet
 
 ```yaml
 Resources:
-  # WhatsApp Replies Queue & DLQ
-  WhatsAppRepliesDLQ:
+  # Trigger Queue & DLQ
+  TriggerDelayDLQ:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub '${ProjectPrefix}-whatsapp-replies-dlq-${EnvironmentName}'
+      QueueName: !Sub '${ProjectPrefix}-trigger-delay-dlq-${EnvironmentName}'
       MessageRetentionPeriod: 1209600
-      # Additional properties as defined in this LLD
-
-  WhatsAppRepliesQueue:
+      SqsManagedSseEnabled: true
+  TriggerDelayQueue:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub '${ProjectPrefix}-whatsapp-replies-queue-${EnvironmentName}'
-      DelaySeconds: 30
-      VisibilityTimeout: 905
+      QueueName: !Sub '${ProjectPrefix}-trigger-delay-queue-${EnvironmentName}'
+      VisibilityTimeout: 905 # Match MessagingLambda timeout + buffer
       MessageRetentionPeriod: 345600
       RedrivePolicy:
-        deadLetterTargetArn: !GetAtt WhatsAppRepliesDLQ.Arn
+        deadLetterTargetArn: !GetAtt TriggerDelayDLQ.Arn
         maxReceiveCount: 3
-      # Additional properties as defined in this LLD
+      SqsManagedSseEnabled: true
 
-  # Human Handoff Queue & DLQ
-  # Similar definitions
+  # WhatsApp Target Queue & DLQ
+  WhatsAppTargetDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectPrefix}-whatsapp-target-dlq-${EnvironmentName}'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+  WhatsAppTargetQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectPrefix}-whatsapp-target-queue-${EnvironmentName}'
+      VisibilityTimeout: 300 # Example - Adjust for consumer
+      MessageRetentionPeriod: 345600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WhatsAppTargetDLQ.Arn
+        maxReceiveCount: 3
+      SqsManagedSseEnabled: true
+
+  # SMS Target Queue & DLQ (Define similarly)
+  # Email Target Queue & DLQ (Define similarly)
+
+  # Human Handoff Queue
+  HumanHandoffQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectPrefix}-human-handoff-queue-${EnvironmentName}'
+      VisibilityTimeout: 3600 # Example - Adjust for manual processing window
+      MessageRetentionPeriod: 604800 # Longer retention (7 days)
+      SqsManagedSseEnabled: true
+      # No RedrivePolicy
+
 ```
 
 ## 12. Happy Path Analysis
 
-### 12.1 WhatsApp Replies Queue
+### 12.1 Trigger -> Target Queue Path
 
 #### Preconditions
-- IncomingWebhookHandler Lambda has processed a valid webhook
-- Conversation found in DynamoDB with handoff_to_human = false
+-   `StagingLambda` processes a valid webhook.
+-   Conversation found, rules valid, routing determines a channel-specific target (e.g., WhatsApp).
+-   Trigger lock acquired, trigger message sent to `TriggerDelayQueue` with `DelaySeconds=W`.
 
 #### Flow
-1. IncomingWebhookHandler constructs message payload
-2. Message is sent to WhatsApp Replies Queue
-3. Message remains invisible for 30 seconds (DelaySeconds)
-4. After delay, message becomes available for processing
-5. ReplyProcessorLambda is triggered and receives the message
-6. Message becomes invisible for duration of VisibilityTimeout
-7. ReplyProcessorLambda successfully processes message
-8. Message is deleted from the queue
+1.  Trigger message waits in `TriggerDelayQueue` for `W` seconds.
+2.  `MessagingLambda` is triggered by the message.
+3.  `MessagingLambda` acquires processing lock, queries `conversations-stage`, merges messages.
+4.  `MessagingLambda` sends merged payload to `WhatsAppTargetQueue`.
+5.  `MessagingLambda` cleans up stage/lock tables, releases processing lock, returns success.
+6.  Trigger message is deleted from `TriggerDelayQueue`.
+7.  Downstream consumer (e.g., AI Lambda) retrieves merged payload from `WhatsAppTargetQueue`, processes it, and deletes the message.
 
 #### Expected Outcome
-- Message is successfully processed by ReplyProcessorLambda
-- Queue metrics show normal message flow
-- No messages accumulate in the queue
+-   Merged payload is successfully processed by the downstream consumer.
+-   Queue metrics show normal flow through Trigger and Target queues.
 
-### 12.2 Human Handoff Queue
+### 12.2 Trigger -> Human Handoff Path
 
 #### Preconditions
-- IncomingWebhookHandler Lambda has processed a valid webhook
-- Conversation found in DynamoDB with handoff_to_human = true
+-   `StagingLambda` processes a valid webhook.
+-   Conversation found, rules valid, routing determines `HumanHandoffQueue`.
+-   Trigger lock acquired, trigger message sent to `TriggerDelayQueue` with `DelaySeconds=W`.
 
 #### Flow
-1. IncomingWebhookHandler constructs message payload
-2. Message is sent to Human Handoff Queue
-3. Message is immediately available for processing (no delay)
-4. Human interface system receives the message
-5. Message becomes invisible for duration of VisibilityTimeout
-6. Human interface system successfully processes message
-7. Message is deleted from the queue
+1.  Trigger message waits in `TriggerDelayQueue` for `W` seconds.
+2.  `MessagingLambda` is triggered.
+3.  `MessagingLambda` acquires lock, queries stage, merges messages.
+4.  `MessagingLambda` sends merged payload to `HumanHandoffQueue`.
+5.  `MessagingLambda` cleans up, releases lock, returns success.
+6.  Trigger message deleted from `TriggerDelayQueue`.
+7.  Human Interface system retrieves merged payload from `HumanHandoffQueue`, processes/displays it, and deletes the message.
 
 #### Expected Outcome
-- Message is successfully delivered to human operators
-- Queue metrics show normal message flow
-- No messages accumulate in the queue
+-   Merged payload delivered to human operators/interface.
+-   Metrics show flow through Trigger Queue and messages accumulating/being processed in Handoff Queue.
 
 ## 13. Unhappy Path Analysis
 
-### 13.1 Processing Failure
+### 13.1 Trigger Processing Failure (`MessagingLambda`)
 
 #### Flow
-1. Message is retrieved by ReplyProcessorLambda
-2. Processing fails (e.g., OpenAI API error)
-3. Lambda function exits without deleting the message
-4. After VisibilityTimeout expires, message becomes visible again
-5. Process repeats for maxReceiveCount attempts
-6. After maxReceiveCount failures, message is moved to DLQ
-7. CloudWatch alarm triggers notification
+1.  `MessagingLambda` retrieves trigger message.
+2.  Processing fails (e.g., error querying DynamoDB, internal bug) before completion.
+3.  Lambda function exits/crashes *without* returning success to SQS.
+4.  After `VisibilityTimeout` expires, trigger message becomes visible again in `TriggerDelayQueue`.
+5.  Process repeats for `maxReceiveCount` attempts.
+6.  After `maxReceiveCount` failures, trigger message moves to `TriggerDelayDLQ`.
+7.  CloudWatch alarm triggers notification.
 
 #### Expected Outcome
-- After temporary failures, message is reprocessed
-- After persistent failures, message moves to DLQ
-- Operations team is notified of DLQ messages
+-   After temporary failures, trigger is reprocessed.
+-   After persistent failures, trigger message moves to `TriggerDelayDLQ`. Operations team notified.
 
-### 13.2 Queue Service Disruption
+### 13.2 Target Queue Consumer Failure
 
 #### Flow
-1. SQS service experiences disruption
-2. Messages cannot be sent or received
-3. IncomingWebhookHandler Lambda fails with SQS service exception
-4. CloudWatch logs show SQS errors
-5. SQS service recovers
-6. Normal operation resumes
+1.  Consumer Lambda/System retrieves merged payload from a Target Queue (e.g., WhatsApp).
+2.  Processing fails. Lambda exits without deleting message.
+3.  After `VisibilityTimeout`, message becomes visible again in Target Queue.
+4.  Repeats `maxReceiveCount` times.
+5.  Message moves to the respective Target DLQ (e.g., `WhatsAppTargetDLQ`).
+6.  CloudWatch alarm triggers.
 
 #### Expected Outcome
-- Temporary service disruption is logged
-- Lost messages (if any) are identified through monitoring
-- System recovers automatically when SQS service is restored
+-   Persistent consumer failures result in messages in the Target DLQ. Operations team notified.
+
+### 13.3 Human Handoff Processing Issue
+
+#### Flow
+1.  Human Interface retrieves message from `HumanHandoffQueue`.
+2.  Operator takes action, but system fails to delete message from SQS before `VisibilityTimeout`.
+3.  Message reappears in `HumanHandoffQueue`.
+
+#### Expected Outcome
+-   Message might be presented to operators multiple times if not deleted correctly. Requires robust handling in the Human Interface system and monitoring of `ApproximateAgeOfOldestMessage` and `ApproximateNumberOfMessagesVisible` for the Handoff Queue. Messages remain until deleted or retention period expires.
 
 ## 14. Next Steps
 
-1. Create SQS queues via AWS CLI
-2. Document queue URLs and ARNs
-3. Configure CloudWatch metrics and alarms
-4. Set up DLQ monitoring
-5. Develop and test SQS integration in Lambda functions
-6. Create queue management utilities for redriving DLQ messages if needed 
+1.  Define final queue names and parameters.
+2.  Create/Update SQS queues via AWS CLI or SAM template.
+3.  Document queue URLs/ARNs for Lambda environment variables/parameters.
+4.  Configure CloudWatch metrics and alarms for all queues/DLQs.
+5.  Develop/update and test SQS integration in `StagingLambda` and `MessagingLambda`.
+6.  Develop consumers for Target Queues and Human Handoff Queue.
+7.  Create queue management utilities (e.g., for DLQ redrive) if needed. 
