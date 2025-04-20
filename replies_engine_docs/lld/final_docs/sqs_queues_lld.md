@@ -434,4 +434,48 @@ Resources:
 6.  Configure `MessagingLambda` event source mapping to trigger from Channel Queues.
 7.  Develop/update and test SQS integration in `StagingLambda` and `MessagingLambda`.
 8.  Develop consumers for Handoff Queue and downstream consumers of `MessagingLambda`'s output.
-9.  Create queue management utilities (e.g., for DLQ redrive) if needed. 
+9.  Create queue management utilities (e.g., for DLQ redrive) if needed.
+
+## 14. Manual Deployment Status (AWS CLI)
+
+This section tracks the progress of manually deploying the SQS queues described in this document using the AWS CLI for the `test` environment with prefix `ai-multi-comms-replies`.
+
+*   **Prefix:** `ai-multi-comms-replies`
+*   **Environment:** `test`
+
+**Status:**
+*   [x] Create WhatsApp DLQ (`ai-multi-comms-replies-whatsapp-dlq-test`)
+    *   SSE Enabled: Yes
+    *   Retention: 14 days (1209600s)
+*   [x] Create SMS DLQ (`ai-multi-comms-replies-sms-dlq-test`)
+    *   SSE Enabled: Yes
+    *   Retention: 14 days (1209600s)
+*   [x] Create Email DLQ (`ai-multi-comms-replies-email-dlq-test`)
+    *   SSE Enabled: Yes
+    *   Retention: 14 days (1209600s)
+*   [x] Create Human Handoff Queue (`ai-multi-comms-replies-human-handoff-queue-test`)
+    *   SSE Enabled: Yes
+    *   Retention: 7 days (604800s)
+    *   Visibility Timeout: 1 hour (3600s)
+    *   Delay: 0s
+*   [x] Create WhatsApp Main Queue (`ai-multi-comms-replies-whatsapp-queue-test`)
+    *   SSE Enabled: Yes
+    *   Retention: 4 days (345600s)
+    *   Visibility Timeout: 905s
+*   [x] Add Redrive Policy to WhatsApp Main Queue
+    *   `deadLetterTargetArn`: `arn:aws:sqs:eu-north-1:337909745089:ai-multi-comms-replies-whatsapp-dlq-test`
+    *   `maxReceiveCount`: 3
+*   [x] Create SMS Main Queue (`ai-multi-comms-replies-sms-queue-test`)
+    *   SSE Enabled: Yes
+    *   Retention: 4 days (345600s)
+    *   Visibility Timeout: 905s
+*   [x] Add Redrive Policy to SMS Main Queue
+    *   `deadLetterTargetArn`: `arn:aws:sqs:eu-north-1:337909745089:ai-multi-comms-replies-sms-dlq-test`
+    *   `maxReceiveCount`: 3
+*   [x] Create Email Main Queue (`ai-multi-comms-replies-email-queue-test`)
+    *   SSE Enabled: Yes
+    *   Retention: 4 days (345600s)
+    *   Visibility Timeout: 905s
+*   [x] Add Redrive Policy to Email Main Queue
+    *   `deadLetterTargetArn`: `arn:aws:sqs:eu-north-1:337909745089:ai-multi-comms-replies-email-dlq-test`
+    *   `maxReceiveCount`: 3 

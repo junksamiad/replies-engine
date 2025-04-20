@@ -1,16 +1,45 @@
 # webhook_handler/core/routing.py
 import os
+import logging
 
-# Placeholder Queue Names/URLs - these should come from config/env vars
-# TODO: Replace with environment variable lookups using os.environ.get
-HANDOFF_QUEUE_URL = os.environ.get("HANDOFF_QUEUE_URL", "YOUR_HANDOFF_QUEUE_URL_PLACEHOLDER")
-WHATSAPP_QUEUE_URL = os.environ.get("WHATSAPP_QUEUE_URL", "YOUR_WHATSAPP_QUEUE_URL_PLACEHOLDER")
-SMS_QUEUE_URL = os.environ.get("SMS_QUEUE_URL", "YOUR_SMS_QUEUE_URL_PLACEHOLDER")
-EMAIL_QUEUE_URL = os.environ.get("EMAIL_QUEUE_URL", "YOUR_EMAIL_QUEUE_URL_PLACEHOLDER")
+logger = logging.getLogger(__name__)
+logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO').upper())
+
+# --- Queue URL Configuration ---
+# Retrieve URLs from environment variables. Raise error if any are missing.
+
+REQUIRED_ENV_VARS = [
+    "HANDOFF_QUEUE_URL",
+    "WHATSAPP_QUEUE_URL",
+    "SMS_QUEUE_URL",
+    "EMAIL_QUEUE_URL"
+]
+
+queue_urls = {}
+missing_vars = []
+
+for var_name in REQUIRED_ENV_VARS:
+    url = os.environ.get(var_name)
+    if not url:
+        missing_vars.append(var_name)
+    else:
+        queue_urls[var_name] = url
+
+if missing_vars:
+    error_message = f"Missing required environment variables for SQS queues: {', '.join(missing_vars)}"
+    logger.critical(error_message)
+    # Raising the error here will prevent the Lambda from initializing if config is bad
+    raise EnvironmentError(error_message)
+
+# Assign to constants for clarity within the function
+HANDOFF_QUEUE_URL = queue_urls["HANDOFF_QUEUE_URL"]
+WHATSAPP_QUEUE_URL = queue_urls["WHATSAPP_QUEUE_URL"]
+SMS_QUEUE_URL = queue_urls["SMS_QUEUE_URL"]
+EMAIL_QUEUE_URL = queue_urls["EMAIL_QUEUE_URL"]
 
 def determine_target_queue(context_object):
     """Determines the target SQS queue URL based on routing rules."""
-    print("Determining target queue...")
+    logger.info("Determining target queue...")
     channel_type = context_object.get('channel_type')
 
     # --- Check 1: Explicit handoff flag (Temporarily Commented Out) ---
@@ -22,7 +51,7 @@ def determine_target_queue(context_object):
 
     # 2. Check global auto_queue_reply_message flag
     if context_object.get('auto_queue_reply_message') is True:
-        print("Routing based on auto_queue_reply_message=True")
+        logger.info("Routing based on auto_queue_reply_message=True")
         return HANDOFF_QUEUE_URL
     
     # 3. Check channel-specific auto_queue list
@@ -33,18 +62,18 @@ def determine_target_queue(context_object):
         auto_queue_numbers = context_object.get('auto_queue_reply_message_from_number', []) or [] 
         recipient_tel = context_object.get('recipient_tel') 
         if recipient_tel and recipient_tel in auto_queue_numbers:
-             print(f"Routing based on recipient_tel '{recipient_tel}' found in auto_queue_reply_message_from_number")
+             logger.info(f"Routing based on recipient_tel '{recipient_tel}' found in auto_queue_reply_message_from_number")
              return HANDOFF_QUEUE_URL
     elif channel_type == 'email':
         # Ensure the list exists and handle None case gracefully
         auto_queue_emails = context_object.get('auto_queue_reply_message_from_email', []) or [] 
         recipient_email = context_object.get('recipient_email')
         if recipient_email and recipient_email in auto_queue_emails:
-             print(f"Routing based on recipient_email '{recipient_email}' found in auto_queue_reply_message_from_email")
+             logger.info(f"Routing based on recipient_email '{recipient_email}' found in auto_queue_reply_message_from_email")
              return HANDOFF_QUEUE_URL
 
     # 4. Default to channel-specific batch queue (Happy Path)
-    print("Defaulting to channel-specific queue.")
+    logger.info("Defaulting to channel-specific queue.")
     if channel_type == 'whatsapp':
         return WHATSAPP_QUEUE_URL
     elif channel_type == 'sms':
@@ -53,5 +82,5 @@ def determine_target_queue(context_object):
         return EMAIL_QUEUE_URL
     else:
         # Should not happen if validation passed, but handle defensively
-        print(f"ERROR: Cannot determine queue for unknown channel_type: {channel_type}")
+        logger.error(f"Cannot determine queue for unknown channel_type: {channel_type}")
         return None # Indicate routing failure 

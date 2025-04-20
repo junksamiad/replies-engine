@@ -22,13 +22,12 @@ A dedicated DynamoDB table is used for this temporary storage.
 *   **Table Name:** `conversations-stage`
 *   **Primary Key:**
     *   **Partition Key (PK):** `conversation_id` (Type: String) - Groups all messages belonging to the same conversation.
-    *   **Sort Key (SK):** `message_sid` (Type: String) - Uniquely identifies each message within a conversation, suitable for Twilio messages. (Alternatively, `arrival_timestamp_iso` could be used if `message_sid` isn't always present/unique across channels).
+    *   **Sort Key (SK):** `message_sid` (Type: String) - Uniquely identifies each message within a conversation batch window using the provider's ID (e.g., Twilio SID).
 *   **Key Attributes:**
     *   `conversation_id` (String): The PK.
     *   `message_sid` (String): The SK.
-    *   `primary_channel` (String): The channel identifier (e.g., the company WhatsApp number). Allows direct `GetItem` on the main Conversations table without using GSIs.
+    *   `primary_channel` (String): The *company's* identifier for the channel being used (e.g., the company's Twilio WhatsApp number `+14...`). Allows direct `GetItem` on the main Conversations table.
     *   `body` (String): The raw text content of the incoming user fragment.
-    *   `sender_id` (String, Optional): Identifier of the sender (useful for deduplication / audit).
     *   `received_at` (String **or** Number): UTC ISO‑8601 timestamp (or epoch seconds) of when the fragment was received.
     *   `expires_at` (Number – TTL): Unix epoch seconds. `now + W + buffer` so DynamoDB auto‑purges the row after the batch window.
 *   **TTL (Optional but Recommended):** Consider adding a TTL attribute (e.g., `expires_at`) set to a reasonable duration (e.g., 24-72 hours) to automatically clean up any records that might somehow be orphaned if the `BatchProcessorLambda` fails permanently. This acts as a safety net.
@@ -50,7 +49,7 @@ After successfully determining the `target_queue_url` for a validated `context_o
     # Assume dynamodb_table is a boto3 DynamoDB Table resource for conversations-stage
 
     conversation_id = context_object['conversation_id']
-    message_sid = context_object['message_sid'] # Ensure this exists and is unique
+    message_sid = context_object['message_sid']
     received_at_iso = datetime.datetime.utcnow().isoformat()
 
     # Optional: Convert floats to Decimals if present in context_object
@@ -62,12 +61,11 @@ After successfully determining the `target_queue_url` for a validated `context_o
         'message_sid': message_sid,
         'primary_channel': context_object['primary_channel'],
         'body': context_object['body'],
-        # Optional depending on channel/provider:
-        'sender_id': context_object.get('sender_id'),
         'received_at': received_at_iso,
-        # TTL so DynamoDB cleans up after batch window + safety buffer
         'expires_at': int(time.time()) + (W + BUFFER)
     }
+    # Remove None values before writing
+    stage_item = {k: v for k, v in stage_item.items() if v is not None}
 
     ```
 2.  **Execute `PutItem`:** Write the item to the `conversations-stage` table. A standard `PutItem` is used here, as overwriting based on `conversation_id` + `message_sid` is acceptable (and unlikely if `message_sid` is truly unique).
@@ -90,5 +88,5 @@ After successfully determining the `target_queue_url` for a validated `context_o
 
 *   **Reliable Capture:** Ensures that every validated incoming message's context is saved, even if subsequent steps (like acquiring the trigger lock or sending the SQS message) fail transiently.
 *   **Decoupling:** Further decouples the initial receipt and validation from the batch processing logic.
-*   **Batch Assembly:** Provides the source data for the `BatchProcessorLambda` to query and assemble the full batch of messages based on `conversation_id` when its trigger fires.
+*   **Batch Assembly:** Provides the source data for the `MessagingLambda` to query by `conversation_id`, sort by `received_at`/`message_sid`, and assemble the full batch of message fragments.
 *   **Atomicity:** Each message write is atomic at the item level. 

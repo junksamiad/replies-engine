@@ -132,14 +132,13 @@ The `StagingLambda` (Stage 1) function acts as the central, unified, and fast en
     *   **Action:** Perform a `PutItem` operation on the `conversations-stage` table.
     *   **Item:**
         *   PK: `conversation_id`
-        *   SK: `message_sid`
+        *   SK: `message_sid` (Provider's message ID, e.g., Twilio SID)
         *   Attributes:
-            *   `primary_channel` – value copied from the incoming conversation record (e.g., company WhatsApp number)
+            *   `primary_channel` – Company's channel identifier
             *   `body` – raw user message fragment
-            *   `sender_id` (optional) – user identifier useful for audit/deduplication
             *   `received_at` – ISO‑8601 (or epoch) timestamp when fragment arrived
-            *   `expires_at` – Unix epoch seconds (`now + W + buffer`) so DynamoDB TTL auto‑purges after the batch window.
-    *   *On Failure:* Log error. Catch specific `ClientError` exceptions from DynamoDB. Map known transient AWS error codes (e.g., `ProvisionedThroughputExceededException`, `InternalServerError`, `ThrottlingException`) to a specific internal error code like `'STAGE_DB_TRANSIENT_ERROR'`. Map configuration errors (e.g., `ResourceNotFoundException`, `AccessDeniedException`) to `'STAGE_DB_CONFIG_ERROR'`. Map data validation errors (`ValidationException`) to `'STAGE_DB_VALIDATION_ERROR'`. Use a default `'STAGE_WRITE_ERROR'` for other client errors. Handle unexpected Python errors with `'INTERNAL_ERROR'`. The handler then proceeds to Step 8 using the determined internal error code.
+            *   `expires_at` – Unix epoch seconds (`now + W + buffer`) for TTL.
+    *   *On Failure:* Log error. Call `_determine_final_error_response` with appropriate internal error code (e.g., `STAGE_DB_TRANSIENT_ERROR`, `STAGE_DB_CONFIG_ERROR`, `STAGE_WRITE_ERROR`).
     *   **Example Error Handling Snippet:**
         ```python
         # Within the handler, after determining item_to_write
