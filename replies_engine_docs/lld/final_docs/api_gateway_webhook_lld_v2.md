@@ -428,7 +428,6 @@ This section tracks the progress of manually deploying the API Gateway component
 - [x] Apply Resource Policy (Require `X-Twilio-Signature`)
 - [ ] Configure `/whatsapp` POST Integration (Lambda Proxy)
 - [ ] Configure `/whatsapp` POST Integration Responses (Error Mapping)
-- [ ] Configure /whatsapp POST Integration Responses (Error Mapping)
     - **Goal:** Ensure Twilio retries *only* on transient errors (DB unavailable, etc.) and *not* on validation/application errors. See Section 5.2.1 for details.
     - **Required Mapping:** Configure mappings to translate specific Lambda execution errors (Exceptions raised for transient codes like `DB_TRANSIENT_ERROR`) into appropriate HTTP 5xx status codes (e.g., 503 or 500).
     - **Error Pattern:** Use `SelectionPattern` based on the Lambda exception message (e.g., matching `.*Transient server error:.*`).

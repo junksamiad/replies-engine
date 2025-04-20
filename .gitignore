@@ -37,4 +37,8 @@ samconfig.toml
 .vscode/
 
 # Node (for AWS CDK)
-node_modules/ 
+node_modules/
+
+# Project Specific Ignores
+replies_engine_docs/example/
+template-sender-engine/ 
