@@ -55,8 +55,14 @@ Below is a consolidated list of the low‑level design edits we've agreed upon s
 
 -  Issue one **UpdateItem** that:
    1. **Appends** a new message entry to `messages` (using `list_append(if_not_exists(...), ...)`).
+      • The new message entry must conform to the `messages` list schema:
+        - `message_id` (String): the Twilio Message SID
+        - `timestamp` (String): ISO 8601 UTC when the user turn was processed
+        - `role` (String): set to "user"
+        - `content` (String): the merged user message text
    2. **Sets** `conversation_status` to `processing_reply`.
    3. **Updates** `updated_at` with the current timestamp.
+
 -  **ConditionExpression:**
    ```text
    conversation_status <> 'processing_reply'
@@ -67,11 +73,8 @@ Below is a consolidated list of the low‑level design edits we've agreed upon s
 
 ### 2.5 Outbound Context Assembly
 
--  After the update, **fetch** the updated conversation record.
--  Build the next `context_object` for the downstream step by combining:
-   -  The fresh conversation record.
-   -  `combined_body` (latest user turn).
-   -  Any routing metadata (e.g., target queue URL, channel method).
+-  After the update, **fetch** the updated conversation record (using a strongly consistent GetItem).
+-  Use the returned record **directly** as the `context_object` for downstream processing; it already contains the newly appended user message and the `channel_method` attribute.  No additional metadata enrichment is required.
 
 ### 2.6 Cleanup Timing
 
