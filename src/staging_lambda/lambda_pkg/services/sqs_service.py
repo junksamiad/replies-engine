@@ -92,9 +92,34 @@ def send_message_to_queue(target_queue_url, context_object):
             return 'INTERNAL_ERROR' # JSON issue is likely an internal problem
     else:
         # Send minimal trigger message with delay to Channel Queue
-        message_body = json.dumps({"conversation_id": conversation_id})
+        primary_channel = None
+        from_id = context_object.get('from') # Used by whatsapp/sms
+        from_address = context_object.get('from_address') # Used by email
+        channel_type = context_object.get('channel_type')
+
+        if channel_type in ['whatsapp', 'sms'] and from_id:
+            prefix = f"{channel_type}:"
+            if from_id.startswith(prefix):
+                primary_channel = from_id[len(prefix):]
+            else:
+                logger.warning(f"Expected prefix '{prefix}' not found on from_id '{from_id}' for channel type {channel_type}. Using full value.")
+                primary_channel = from_id # Fallback, might be unexpected
+        elif channel_type == 'email' and from_address:
+            primary_channel = from_address
+        # Add elif blocks for other channel types as needed
+
+        if not primary_channel:
+            logger.error(f"Could not determine primary_channel for SQS message body for {conversation_id}. Context keys: from='{from_id}', from_address='{from_address}', channel_type='{channel_type}'.")
+            return 'INTERNAL_ERROR' # Cannot proceed without primary channel
+
+        # Construct message body with both IDs
+        message_body_dict = {
+            "conversation_id": conversation_id,
+            "primary_channel": primary_channel
+        }
+        message_body = json.dumps(message_body_dict)
         delay_seconds = BATCH_WINDOW_SECONDS
-        logger.info(f"Sending trigger for {conversation_id} to Channel Queue: {target_queue_url} with delay {delay_seconds}s")
+        logger.info(f"Sending trigger for {conversation_id}/{primary_channel} to Channel Queue: {target_queue_url} with delay {delay_seconds}s")
 
     try:
         response = sqs.send_message(
