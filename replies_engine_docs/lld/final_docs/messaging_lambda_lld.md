@@ -26,6 +26,10 @@ This document details the low-level design for the `messaging_lambda` function (
         with the `ConditionExpression` `conversation_status <> :processing_reply`.
     *   **On Success (Lock Acquired):** Continue.
     *   **On Failure (`ConditionalCheckFailedException`):** Another Lambda instance is already working. **Return success** to SQS so the trigger message is deleted.
+3a. **Start SQS Heartbeat (Visibility Extension):**
+    * Instantiate `SQSHeartbeat(queue_url, receipt_handle, interval)` using the queue URL and message `receiptHandle`.
+    * Call `.start()` immediately **after** basic context validation succeeds.
+    * Store the instance so it can be `.stop()`‑ped in a `finally` block and checked for errors.
 3.  **Query Staging Table (Consistent Read):**
     *   **Action:** `Query` the `conversations-stage` table **with `ConsistentRead=True`** to guarantee visibility of the most recent fragment writes.
     *   **Key:** `PK = conversation_id`.
@@ -58,7 +62,9 @@ This document details the low-level design for the `messaging_lambda` function (
         *   `BatchWriteItem` deletes the processed items from `conversations-stage`.
         *   Delete the corresponding row from `conversations-trigger-lock`.
 11. **Release Processing Lock:** Update `conversation_status` back to an idle value (e.g., `reply_sent` or `queued_for_ai`).
-12. **Lambda Success:** Return success so SQS deletes the trigger message.
+12. **Lambda Success:** 
+    * **Stop Heartbeat & Check Errors:** Call `heartbeat.stop()`; if `heartbeat.check_for_errors()` returns an exception, raise it so SQS will retry.
+    * Return success so SQS deletes the trigger message.
 
 ## 4. Error Handling Considerations
 

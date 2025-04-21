@@ -1,0 +1,38 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "VisualEditor0",
+            "Effect": "Allow",
+            "Action": "dynamodb:PutItem",
+            "Resource": [
+                "arn:aws:dynamodb:eu-north-1:337909745089:table/conversations-stage-test",
+                "arn:aws:dynamodb:eu-north-1:337909745089:table/conversations-trigger-lock-test"
+            ]
+        },
+        {
+            "Sid": "VisualEditor1",
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogStream",
+                "secretsmanager:GetSecretValue",
+                "sqs:SendMessage",
+                "dynamodb:Query",
+                "logs:CreateLogGroup",
+                "logs:PutLogEvents"
+            ],
+            "Resource": [
+                "arn:aws:sqs:eu-north-1:337909745089:ai-multi-comms-replies-whatsapp-queue-test",
+                "arn:aws:sqs:eu-north-1:337909745089:ai-multi-comms-replies-sms-queue-test",
+                "arn:aws:sqs:eu-north-1:337909745089:ai-multi-comms-replies-email-queue-test",
+                "arn:aws:sqs:eu-north-1:337909745089:ai-multi-comms-replies-human-handoff-queue-test",
+                "arn:aws:logs:eu-north-1:337909745089:log-group:/aws/lambda/staging-lambda-test:*",
+                "arn:aws:secretsmanager:eu-north-1:337909745089:secret:/replies-engine/dev/twilio-*",
+                "arn:aws:dynamodb:eu-north-1:337909745089:table/ai-multi-comms-conversations-dev/index/*",
+                "arn:aws:dynamodb:eu-north-1:337909745089:table/ai-multi-comms-conversations-dev"
+            ]
+        }
+    ]
+
+,{\"Effect\": \"Allow\",\"Action\": \"secretsmanager:GetSecretValue\",\"Resource\": \"arn:aws:secretsmanager:eu-north-1:337909745089:secret:ai-multi-comms/whatsapp-credentials/cucumber-recruitment/clarify-cv/twilio-dev-*\"}
+]}

@@ -1,0 +1,40 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+            ],
+            "Resource": "arn:aws:logs:eu-north-1:337909745089:log-group:/aws/lambda/staging-lambda-test:*" 
+        },
+        {
+            "Effect": "Allow",
+            "Action": "dynamodb:Query",
+            "Resource": [
+                "arn:aws:dynamodb:eu-north-1:337909745089:table/ai-multi-comms-conversations-dev",
+                "arn:aws:dynamodb:eu-north-1:337909745089:table/ai-multi-comms-conversations-dev/index/*"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": "dynamodb:PutItem",
+            "Resource": [
+                "arn:aws:dynamodb:eu-north-1:337909745089:table/conversations-stage-test",
+                "arn:aws:dynamodb:eu-north-1:337909745089:table/conversations-trigger-lock-test"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": "sqs:SendMessage",
+            "Resource": [
+                "arn:aws:sqs:eu-north-1:337909745089:ai-multi-comms-replies-whatsapp-queue-test",
+                "arn:aws:sqs:eu-north-1:337909745089:ai-multi-comms-replies-sms-queue-test",
+                "arn:aws:sqs:eu-north-1:337909745089:ai-multi-comms-replies-email-queue-test",
+                "arn:aws:sqs:eu-north-1:337909745089:ai-multi-comms-replies-human-handoff-queue-test"
+            ]
+        }
+    ]
+} 

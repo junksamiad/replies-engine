@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "title": "TwilioWebhookPayload",
+  "type": "object",
+  "properties": {
+    "From":      { "type": "string", "description": "Sender phone number (e.g., whatsapp:+1...)" },
+    "To":        { "type": "string", "description": "Recipient/Company Twilio number (e.g., whatsapp:+1...)" },
+    "Body":      { "type": "string", "description": "Incoming message text" },
+    "AccountSid":{ "type": "string", "description": "Twilio Account SID" },
+    "MessageSid":{ "type": "string", "description": "Twilio Message SID" }
+  },
+  "required": ["From", "To", "Body", "AccountSid", "MessageSid"]
+} 

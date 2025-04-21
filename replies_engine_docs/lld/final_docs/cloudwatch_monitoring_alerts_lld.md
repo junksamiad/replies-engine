@@ -18,11 +18,11 @@ This LLD focuses on the CloudWatch configuration required for effective monitori
 ### 2.1 Lambda Function Log Groups
 
 ```yaml
-# IncomingWebhookHandler Log Group
-IncomingWebhookHandlerLogGroup:
+# Staging Lambda Log Group (Formerly IncomingWebhookHandler)
+stagingLambdaLogGroup:
   Type: AWS::Logs::LogGroup
   Properties:
-    LogGroupName: !Sub '/aws/lambda/${ProjectPrefix}-incoming-webhook-handler-${EnvironmentName}'
+    LogGroupName: !Sub '/aws/lambda/${ProjectPrefix}-staging-lambda-${EnvironmentName}'
     RetentionInDays: 14
 
 # ReplyProcessorLambda Log Group
@@ -49,14 +49,14 @@ ApiGatewayLogGroup:
 ### 3.1 Error Rate Metric Filters
 
 ```yaml
-# IncomingWebhookHandler Error Metric Filter
-IncomingWebhookHandlerErrorMetricFilter:
+# Staging Lambda Error Metric Filter
+stagingLambdaErrorMetricFilter:
   Type: AWS::Logs::MetricFilter
   Properties:
-    LogGroupName: !Ref IncomingWebhookHandlerLogGroup
+    LogGroupName: !Ref stagingLambdaLogGroup
     FilterPattern: '?ERROR ?Error ?error'
     MetricTransformations:
-      - MetricName: IncomingWebhookHandlerErrors
+      - MetricName: stagingLambdaErrors
         MetricNamespace: !Sub '${ProjectPrefix}/${EnvironmentName}'
         MetricValue: '1'
         DefaultValue: 0
@@ -92,27 +92,40 @@ DynamoDBFinalUpdateFailureMetricFilter:
         DefaultValue: 0
         Unit: Count
 
-# Missing Conversation Metric Filter
+# Missing Conversation Metric Filter (Staging Lambda - Might indicate config issue)
 MissingConversationMetricFilter:
   Type: AWS::Logs::MetricFilter
   Properties:
-    LogGroupName: !Ref IncomingWebhookHandlerLogGroup
-    FilterPattern: 'WARNING No conversation found for'
+    LogGroupName: !Ref stagingLambdaLogGroup
+    FilterPattern: '"status": "NOT_FOUND"'
     MetricTransformations:
-      - MetricName: MissingConversationCount
+      - MetricName: CredentialLookupNotFoundCount
         MetricNamespace: !Sub '${ProjectPrefix}/${EnvironmentName}'
         MetricValue: '1'
         DefaultValue: 0
         Unit: Count
 
-# Invalid Signature Metric Filter
+# Invalid Signature Metric Filter (Staging Lambda)
 InvalidSignatureMetricFilter:
   Type: AWS::Logs::MetricFilter
   Properties:
-    LogGroupName: !Ref IncomingWebhookHandlerLogGroup
-    FilterPattern: 'WARNING Invalid Twilio signature'
+    LogGroupName: !Ref stagingLambdaLogGroup
+    FilterPattern: '"INVALID_SIGNATURE"'
     MetricTransformations:
       - MetricName: InvalidSignatureCount
+        MetricNamespace: !Sub '${ProjectPrefix}/${EnvironmentName}'
+        MetricValue: '1'
+        DefaultValue: 0
+        Unit: Count
+
+# Secrets Fetch Failure Metric Filter (Staging Lambda)
+SecretsFetchFailedMetricFilter:
+  Type: AWS::Logs::MetricFilter
+  Properties:
+    LogGroupName: !Ref stagingLambdaLogGroup
+    FilterPattern: '"SECRET_FETCH_FAILED"'
+    MetricTransformations:
+      - MetricName: SecretFetchFailedCount
         MetricNamespace: !Sub '${ProjectPrefix}/${EnvironmentName}'
         MetricValue: '1'
         DefaultValue: 0
@@ -124,14 +137,14 @@ InvalidSignatureMetricFilter:
 ### 4.1 Lambda Error Rate Alarms
 
 ```yaml
-# IncomingWebhookHandler Error Rate Alarm
-IncomingWebhookHandlerErrorAlarm:
+# Staging Lambda Error Rate Alarm
+stagingLambdaErrorAlarm:
   Type: AWS::CloudWatch::Alarm
   Properties:
-    AlarmName: !Sub '${ProjectPrefix}-IncomingWebhookHandler-ErrorRate-${EnvironmentName}'
-    AlarmDescription: 'Alarm when IncomingWebhookHandler error rate exceeds threshold'
+    AlarmName: !Sub '${ProjectPrefix}-stagingLambda-ErrorRate-${EnvironmentName}'
+    AlarmDescription: 'Alarm when Staging Lambda error rate exceeds threshold'
     Namespace: !Sub '${ProjectPrefix}/${EnvironmentName}'
-    MetricName: IncomingWebhookHandlerErrors
+    MetricName: stagingLambdaErrors
     Statistic: Sum
     Period: 60
     EvaluationPeriods: 5
@@ -162,17 +175,17 @@ ReplyProcessorLambdaErrorAlarm:
 ### 4.2 Lambda Invocation Alarms
 
 ```yaml
-# IncomingWebhookHandler Invocation Alarm
-IncomingWebhookHandlerInvocationAlarm:
+# Staging Lambda Invocation Alarm
+stagingLambdaInvocationAlarm:
   Type: AWS::CloudWatch::Alarm
   Properties:
-    AlarmName: !Sub '${ProjectPrefix}-IncomingWebhookHandler-Invocations-${EnvironmentName}'
-    AlarmDescription: 'Alarm when IncomingWebhookHandler has no invocations for 15 minutes'
+    AlarmName: !Sub '${ProjectPrefix}-stagingLambda-Invocations-${EnvironmentName}'
+    AlarmDescription: 'Alarm when Staging Lambda has no invocations for 15 minutes'
     Namespace: 'AWS/Lambda'
     MetricName: Invocations
     Dimensions:
       - Name: FunctionName
-        Value: !Sub '${ProjectPrefix}-incoming-webhook-handler-${EnvironmentName}'
+        Value: !Sub '${ProjectPrefix}-staging-lambda-${EnvironmentName}'
     Statistic: Sum
     Period: 900
     EvaluationPeriods: 1
@@ -217,6 +230,40 @@ DynamoDBFinalUpdateFailureAlarm:
     MetricName: DynamoDBFinalUpdateFailures
     Statistic: Sum
     Period: 60
+    EvaluationPeriods: 1
+    Threshold: 0
+    ComparisonOperator: GreaterThanThreshold
+    TreatMissingData: notBreaching
+    AlarmActions:
+      - !Ref AlertsTopicArn
+
+# Invalid Signature Alarm (Staging Lambda)
+InvalidSignatureAlarm:
+  Type: AWS::CloudWatch::Alarm
+  Properties:
+    AlarmName: !Sub '${ProjectPrefix}-StagingLambda-InvalidSignature-${EnvironmentName}'
+    AlarmDescription: 'CRITICAL: Staging Lambda detected an invalid Twilio signature'
+    Namespace: !Sub '${ProjectPrefix}/${EnvironmentName}'
+    MetricName: InvalidSignatureCount
+    Statistic: Sum
+    Period: 60
+    EvaluationPeriods: 1
+    Threshold: 0
+    ComparisonOperator: GreaterThanThreshold
+    TreatMissingData: notBreaching
+    AlarmActions:
+      - !Ref AlertsTopicArn
+
+# Secrets Fetch Failure Alarm (Staging Lambda)
+SecretsFetchFailedAlarm:
+  Type: AWS::CloudWatch::Alarm
+  Properties:
+    AlarmName: !Sub '${ProjectPrefix}-StagingLambda-SecretsFetchFailed-${EnvironmentName}'
+    AlarmDescription: 'CRITICAL: Staging Lambda failed to retrieve required credentials from Secrets Manager'
+    Namespace: !Sub '${ProjectPrefix}/${EnvironmentName}'
+    MetricName: SecretFetchFailedCount
+    Statistic: Sum
+    Period: 300
     EvaluationPeriods: 1
     Threshold: 0
     ComparisonOperator: GreaterThanThreshold
@@ -307,7 +354,7 @@ MonitoringDashboard:
             "height": 6,
             "properties": {
               "metrics": [
-                [ "AWS/Lambda", "Invocations", "FunctionName", "${ProjectPrefix}-incoming-webhook-handler-${EnvironmentName}", { "stat": "Sum", "period": 300 } ],
+                [ "AWS/Lambda", "Invocations", "FunctionName", "${ProjectPrefix}-staging-lambda-${EnvironmentName}", { "stat": "Sum", "period": 300 } ],
                 [ "AWS/Lambda", "Invocations", "FunctionName", "${ProjectPrefix}-reply-processor-${EnvironmentName}", { "stat": "Sum", "period": 300 } ]
               ],
               "view": "timeSeries",
@@ -325,7 +372,7 @@ MonitoringDashboard:
             "height": 6,
             "properties": {
               "metrics": [
-                [ "AWS/Lambda", "Errors", "FunctionName", "${ProjectPrefix}-incoming-webhook-handler-${EnvironmentName}", { "stat": "Sum", "period": 300 } ],
+                [ "AWS/Lambda", "Errors", "FunctionName", "${ProjectPrefix}-staging-lambda-${EnvironmentName}", { "stat": "Sum", "period": 300 } ],
                 [ "AWS/Lambda", "Errors", "FunctionName", "${ProjectPrefix}-reply-processor-${EnvironmentName}", { "stat": "Sum", "period": 300 } ]
               ],
               "view": "timeSeries",
@@ -343,7 +390,7 @@ MonitoringDashboard:
             "height": 6,
             "properties": {
               "metrics": [
-                [ "AWS/Lambda", "Duration", "FunctionName", "${ProjectPrefix}-incoming-webhook-handler-${EnvironmentName}", { "stat": "Average", "period": 300 } ],
+                [ "AWS/Lambda", "Duration", "FunctionName", "${ProjectPrefix}-staging-lambda-${EnvironmentName}", { "stat": "Average", "period": 300 } ],
                 [ "AWS/Lambda", "Duration", "FunctionName", "${ProjectPrefix}-reply-processor-${EnvironmentName}", { "stat": "Average", "period": 300 } ]
               ],
               "view": "timeSeries",
@@ -382,13 +429,14 @@ MonitoringDashboard:
             "properties": {
               "metrics": [
                 [ "${ProjectPrefix}/${EnvironmentName}", "DynamoDBFinalUpdateFailures", { "stat": "Sum", "period": 300 } ],
-                [ "${ProjectPrefix}/${EnvironmentName}", "MissingConversationCount", { "stat": "Sum", "period": 300 } ],
-                [ "${ProjectPrefix}/${EnvironmentName}", "InvalidSignatureCount", { "stat": "Sum", "period": 300 } ]
+                [ "${ProjectPrefix}/${EnvironmentName}", "CredentialLookupNotFoundCount", { "stat": "Sum", "period": 300 } ],
+                [ "${ProjectPrefix}/${EnvironmentName}", "InvalidSignatureCount", { "stat": "Sum", "period": 300 } ],
+                [ "${ProjectPrefix}/${EnvironmentName}", "SecretFetchFailedCount", { "stat": "Sum", "period": 300 } ]
               ],
               "view": "timeSeries",
               "stacked": false,
               "region": "${AWS::Region}",
-              "title": "Custom Metrics",
+              "title": "Custom Staging Lambda Metrics",
               "period": 300
             }
           }
@@ -516,8 +564,9 @@ def setup_logger(context):
 | Metric | Description | Threshold | Alarm |
 |--------|-------------|-----------|-------|
 | DynamoDBFinalUpdateFailures | Failed DynamoDB updates | >0 | Critical |
-| MissingConversationCount | Missing conversation lookups | >10 in 5 minutes | Warning |
-| InvalidSignatureCount | Invalid Twilio signatures | >5 in 5 minutes | Warning |
+| CredentialLookupNotFoundCount | GSI lookup failed | >10 in 5 minutes | Warning |
+| InvalidSignatureCount | Invalid Twilio signatures | >0 | Critical |
+| SecretFetchFailedCount | Failed Secrets Manager calls | >0 | Critical |
 
 ## 10. Implementation and Testing Strategy
 

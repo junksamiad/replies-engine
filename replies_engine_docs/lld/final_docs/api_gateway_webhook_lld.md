@@ -54,72 +54,48 @@ For each resource method:
 
 ## 3. Security Implementation
 
+Security for webhook validation (specifically Twilio signature verification) is now primarily handled within the backend Lambda function (`staging-lambda-test`) integration.
+
 ### 3.1 Resource Policy
 
-A resource policy will be attached to the API Gateway to perform basic filtering of requests before they reach any Lambda function.
+A minimal Resource Policy is applied to API Gateway, primarily to allow invocations from any principal. It does **not** perform specific header checks like `X-Twilio-Signature`.
 
-**Implementation Details:**
+**Implementation Details (Current):**
 ```json
 {
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": "*",
-      "Action": "execute-api:Invoke",
-      "Resource": "execute-api:/*",
-      "Condition": {
-        "StringEquals": {
-          "aws:HeaderExists": "X-Twilio-Signature"
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "execute-api:Invoke",
+            "Resource": "arn:aws:execute-api:<REGION>:<ACCOUNT_ID>:<API_ID>/*" 
         }
-      }
-    },
-    {
-      "Effect": "Deny",
-      "Principal": "*",
-      "Action": "execute-api:Invoke",
-      "Resource": "execute-api:/*",
-      "Condition": {
-        "Bool": {
-          "aws:HeaderExists": "false"  
-        }
-      }
-    }
-  ]
+    ]
 }
 ```
+*(Replace placeholders with actual values)*
 
 **Purpose:**
-- Immediately reject requests without the required `X-Twilio-Signature` header
-- Provide first-line defense against non-Twilio traffic
-- Reduce Lambda invocations for obviously invalid requests
+- Allows API Gateway stage to invoke backend resources.
+- **Note:** Initial attempts to use `Condition` clauses with `aws:RequestHeader/X-Twilio-Signature` (using `Bool` or `Null` checks) failed due to this condition key not being supported for API Gateway resource policies, resulting in persistent 403 errors.
 
 ### 3.2 Request Validation
 
-API Gateway request validators will be configured to ensure incoming webhooks match the expected format before reaching the Lambda function.
+API Gateway Request Validators are **disabled** for the `/whatsapp` and `/sms` POST methods.
 
-**WhatsApp/SMS Required Parameters:**
-- Headers:
-  - `X-Twilio-Signature` (string)
-- Body parameters (application/x-www-form-urlencoded):
-  - `From` (string) - The sender's phone number
-  - `To` (string) - The recipient's phone number
-  - `Body` (string) - The message content
-  - `AccountSid` (string) - Twilio account identifier
-  - `MessageSid` (string) - Message identifier
-
-**Email Required Parameters:** (TBD based on email provider)
-- Appropriate signature headers
-- Sender and recipient information
-- Message content references
+**Reasoning:**
+- The critical validation (Twilio signature verification) must be performed within the Lambda function *after* retrieving tenant-specific credentials from DynamoDB/Secrets Manager.
+- Attempting header or body validation at the API Gateway level proved problematic and unreliable due to the dynamic nature of the required Auth Token and issues with resource policy conditions.
+- Payload format validation (e.g., ensuring required fields like `From`, `To`, `Body` exist) is now handled within the Lambda function's initial parsing step.
 
 **Implementation Method:**
-- Define JSON schema for each channel's expected request format
-- Configure validators in API Gateway for each endpoint
-- Requests not meeting the schema will be rejected with 400 Bad Request
+- Request Validator association on the `/whatsapp` and `/sms` POST methods is set to **NONE**.
+- The method requirement for the `X-Twilio-Signature` header is set to **false**.
 
 ### 3.2.1 Example JSON Schema Model
-Below is an example of an `AWS::ApiGateway::Model` JSON schema for validating a WhatsApp/SMS webhook payload (for `application/x-www-form-urlencoded` after mapping to JSON):
+*(This section can be removed or commented out, as the model is no longer enforced by API Gateway for these paths)*
+<!--
 ```json
 {
   "$schema": "http://json-schema.org/draft-04/schema#",
@@ -135,7 +111,7 @@ Below is an example of an `AWS::ApiGateway::Model` JSON schema for validating a 
   "required": ["From", "To", "Body", "AccountSid", "MessageSid"]
 }
 ```
-This model is then referenced by a **Request Validator** on the `/whatsapp` and `/sms` POST methods to enforce that only well-formed requests reach the Lambda.
+-->
 
 ### 3.3 Throttling and Quotas
 
@@ -221,11 +197,11 @@ Unlike typical REST endpoints, Twilio webhooks expect a `200` status even on app
 
 #### 5.2.1 Twilio (WhatsApp/SMS) Error Mapping
 
-- **Goal:** Ensure Twilio retries only for transient infrastructure/server errors (typically 5xx) and *not* for non-transient validation/application errors (typically 4xx) or unexpected code bugs.
+- **Goal:** Ensure Twilio retries only for transient infrastructure/server errors (typically 5xx) and *not* for non-transient validation/application errors (typically 4xx, including **INVALID_SIGNATURE**) or unexpected code bugs.
 
-- **Implementation via Lambda:** The primary logic for this resides within the `webhook_handler` Lambda function itself:
-    - **Non-Transient Errors (4xx or unexpected 5xx):** When the Lambda detects a non-transient error (e.g., parsing failure, `CONVERSATION_NOT_FOUND`, `PROJECT_INACTIVE`, an unexpected code bug), it **directly returns a 200 OK response with empty TwiML** to API Gateway. This immediately signals success to Twilio and prevents retries.
-    - **Known Transient Errors (expected 5xx):** When the Lambda detects a known transient error (e.g., `DB_TRANSIENT_ERROR`), it **intentionally raises an Exception**. 
+- **Implementation via Lambda:** The primary logic resides within the `staging-lambda-test` function:
+    - **Non-Transient Errors (including INVALID_SIGNATURE):** When the Lambda detects a non-transient error (e.g., parsing failure, `CONVERSATION_NOT_FOUND`, `INVALID_SIGNATURE`, `PROJECT_INACTIVE`), it **directly returns a 200 OK response with empty TwiML** to API Gateway. This immediately signals success to Twilio and prevents retries.
+    - **Known Transient Errors:** When the Lambda detects a known transient error (e.g., `DB_TRANSIENT_ERROR`, `SECRET_FETCH_TRANSIENT_ERROR`), it **intentionally raises an Exception**.
 
 - API Gateway Method Integration Responses example (YAML snippet):
 ```yaml
@@ -274,35 +250,7 @@ Use Integration Responses without override of status code:
 
 ### 5.3 Gateway Responses for Validation Errors
 
-API Gateway can automatically return structured responses for request-validation failures (missing headers, model mismatches):
-```yaml
-Resources:
-  BadRequestBodyGatewayResponse:
-    Type: AWS::ApiGateway::GatewayResponse
-    Properties:
-      RestApiId: !Ref ApiGateway
-      ResponseType: BAD_REQUEST_BODY
-      StatusCode: 400
-      ResponseTemplates:
-        application/json: |
-          { "message": "Invalid request body: $context.error.messageString" }
-      ResponseParameters:
-        gatewayresponse.header.Content-Type: "'application/json'"
-
-  UnauthorizedGatewayResponse:
-    Type: AWS::ApiGateway::GatewayResponse
-    Properties:
-      RestApiId: !Ref ApiGateway
-      ResponseType: UNAUTHORIZED
-      StatusCode: 401
-      ResponseTemplates:
-        application/json: |
-          { "message": "Missing or invalid Twilio signature" }
-      ResponseParameters:
-        gatewayresponse.header.Content-Type: "'application/json'"
-```
-
-These GatewayResponses avoid invoking the Lambda for invalid or unauthorized requests and return clear JSON errors to clients.
+API Gateway automatic Gateway Responses for `BAD_REQUEST_BODY` or `UNAUTHORIZED` (due to missing/invalid signature) are **no longer directly applicable** to the `/whatsapp` and `/sms` POST methods in the current configuration, as the Request Validator requiring these elements is disabled. These responses might become relevant if validators are re-enabled or other authorization mechanisms are added.
 
 ## 6. Monitoring and Logging
 
@@ -416,22 +364,27 @@ Certain resources still require manual setup after stack deployment:
 
 This section tracks the progress of manually deploying the API Gateway components described in this document using the AWS CLI.
 
-- [x] Create REST API (`ai-multi-comms-webhook-dev`)
-- [x] Create Resources (`/whatsapp`, `/sms`, `/email`)
-- [x] Create Request Model (`WhatsAppSMSWebhookModel`)
-- [x] Create Request Validator (`ValidateHeadersAndBody`)
-- [x] Configure `/whatsapp` OPTIONS Method (CORS)
-- [x] Configure `/whatsapp` POST Method (Structure Only)
-- [x] Create IAM Role for Logging (`apigateway-logs-role-ai-multi-comms-webhook-dev`)
-- [x] Ensure CloudWatch Log Group (`/aws/apigateway/ai-multi-comms-webhook-dev-access-logs`)
-- [x] Associate Logging Role with API Gateway Account Settings (`update-account`)
-- [x] Apply Resource Policy (Require `X-Twilio-Signature`)
-- [ ] Configure `/whatsapp` POST Integration (Lambda Proxy)
-- [ ] Configure `/whatsapp` POST Integration Responses (Error Mapping)
-    - **Goal:** Ensure Twilio retries *only* on transient errors (DB unavailable, etc.) and *not* on validation/application errors. See Section 5.2.1 for details.
-    - **Required Mapping:** Configure mappings to translate specific Lambda execution errors (Exceptions raised for transient codes like `DB_TRANSIENT_ERROR`) into appropriate HTTP 5xx status codes (e.g., 503 or 500).
-    - **Error Pattern:** Use `SelectionPattern` based on the Lambda exception message (e.g., matching `.*Transient server error:.*`).
-    - **Default Success:** Ensure the default integration response passes through the 200 OK TwiML returned by the Lambda for successful processing or non-transient errors.
-- [ ] Create Deployment and `dev` Stage
-- [ ] Configure `dev` Stage (Access Logging, Tracing)
-- [ ] Create and Associate Usage Plan / API Key
+*   **REST API ID:** `fjvxpbzh6b` (`ai-multi-comms-webhook-dev`)
+*   **Resource ID (`/whatsapp`):** `gyaxx2`
+
+**Status:**
+*   [x] Create REST API (`ai-multi-comms-webhook-dev`)
+*   [x] Create Resources (`/whatsapp`, `/sms`, `/email`)
+*   [x] Create Request Model (`TwilioWebhookPayloadModel` - ID: `fw4toh`) - *Model exists but not actively used on POST* 
+*   [x] Create/Use Request Validator (`ValidateHeadersAndBody` - ID: `75r6is`) - *Validator exists but DISABLED on POST methods*
+*   [x] Configure `/whatsapp` OPTIONS Method (CORS)
+*   [x] Configure `/whatsapp` POST Method (Structure Only)
+*   [~] Associate Validator & Model with `/whatsapp` POST (`application/x-www-form-urlencoded`) - *Association removed / Validator set to NONE*
+*   [x] Create IAM Role for Logging (`apigateway-logs-role-ai-multi-comms-webhook-dev`)
+*   [x] Ensure CloudWatch Log Group (`/aws/apigateway/ai-multi-comms-webhook-dev-access-logs`)
+*   [x] Associate Logging Role with API Gateway Account Settings (`update-account`)
+*   [x] Apply Resource Policy (Simplified - Allow Invoke, no header check) - *Updated from original design*
+*   [x] Configure `/whatsapp` POST Integration (Lambda Proxy to `staging-lambda-test`)
+    *   Integration URI: `arn:aws:apigateway:eu-north-1:lambda:path/2015-03-31/functions/arn:aws:lambda:eu-north-1:337909745089:function:staging-lambda-test/invocations`
+*   [x] Configure `/whatsapp` POST Integration Responses (Error Mapping)
+    *   Mapped `503` for `.*Transient server error:.*` pattern.
+    *   Mapped `500` for `.*` pattern (catch-all).
+    *   Mapped `200` for default success (passing through body).
+*   [x] Create Deployment (`<LATEST_DEPLOYMENT_ID>`) and associate with `test` Stage
+*   [x] Configure `test` Stage (Access Logging, Tracing) - *Enabled via subsequent updates*
+*   [ ] Create and Associate Usage Plan / API Key - *Skipped (Not Required for current webhook)*
