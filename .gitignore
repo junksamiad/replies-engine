@@ -41,4 +41,44 @@ node_modules/
 
 # Project Specific Ignores
 replies_engine_docs/example/
-template-sender-engine/ 
+template-sender-engine/
+
+# Ignore installed packages within staging_lambda
+src/staging_lambda/__pycache__/
+src/staging_lambda/*.dist-info/
+src/staging_lambda/*.egg-info/
+src/staging_lambda/bin/
+src/staging_lambda/*.zip
+src/*.zip
+src/staging_lambda/aio*/
+src/staging_lambda/attr*/
+src/staging_lambda/awscli/
+src/staging_lambda/boto3/
+src/staging_lambda/botocore/
+src/staging_lambda/certifi/
+src/staging_lambda/charset_normalizer/
+src/staging_lambda/colorama/
+src/staging_lambda/dateutil/
+src/staging_lambda/docutils/
+src/staging_lambda/frozenlist/
+src/staging_lambda/idna/
+src/staging_lambda/iniconfig/
+src/staging_lambda/jmespath/
+src/staging_lambda/jwt/
+src/staging_lambda/multidict/
+src/staging_lambda/packaging/
+src/staging_lambda/pluggy/
+src/staging_lambda/propcache/
+src/staging_lambda/pyasn1/
+src/staging_lambda/pytest/
+src/staging_lambda/_pytest/
+src/staging_lambda/yaml/
+src/staging_lambda/_yaml/
+src/staging_lambda/requests/
+src/staging_lambda/rsa/
+src/staging_lambda/s3transfer/
+src/staging_lambda/six.py
+src/staging_lambda/py.py
+src/staging_lambda/twilio/
+src/staging_lambda/urllib3/
+src/staging_lambda/yarl/ 
