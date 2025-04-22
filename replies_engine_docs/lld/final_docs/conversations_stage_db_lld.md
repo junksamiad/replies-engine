@@ -84,7 +84,20 @@ After successfully determining the `target_queue_url` for a validated `context_o
 
     ```
 
-## 5. Outcome & Benefits
+## 5. TTL (Time To Live) Configuration
+
+*   **Attribute:** The `expires_at` attribute (Type: Number, containing Unix epoch seconds) is designed for TTL.
+*   **Lambda Logic:** The `StagingLambda` calculates and writes this attribute.
+*   **Table Configuration (Required):** TTL **must** be explicitly enabled on the `conversations-stage` DynamoDB table via Infrastructure as Code (e.g., AWS SAM `template.yaml` or CloudFormation).
+    ```yaml
+    # Example SAM/CloudFormation snippet within Table Properties:
+    TimeToLiveSpecification:
+      AttributeName: expires_at
+      Enabled: true
+    ```
+*   **Recommended Duration:** While the Lambda sets a short expiry based on the batch window (`W + buffer`), configuring a longer TTL on the table (e.g., **24-72 hours**) provides a robust safety net to clean up orphaned records in case of persistent processing failures, without relying solely on the explicit cleanup step in `MessagingLambda`.
+
+## 6. Outcome & Benefits
 
 *   **Reliable Capture:** Ensures that every validated incoming message's context is saved, even if subsequent steps (like acquiring the trigger lock or sending the SQS message) fail transiently.
 *   **Decoupling:** Further decouples the initial receipt and validation from the batch processing logic.

@@ -94,4 +94,19 @@ When a validated message arrives and needs to potentially trigger the batch proc
 *   **On Success (First Message):** If the `PutItem` succeeds (no existing item with that `conversation_id`), a simple record `{ "conversation_id": "...", "expires_at": ... }` is created in the `conversations-trigger-lock` table. The handler then proceeds to send the single SQS trigger message **to the appropriate Channel Queue** with `DelaySeconds=W`.
 *   **On Failure (Subsequent Messages):** If the `PutItem` fails with `ConditionalCheckFailedException`, it means a lock record already exists (placed by a previous message in the window). The handler simply catches this specific exception and does *not* send another SQS trigger message.
 *   **Self-Cleaning:** The `expires_at` TTL attribute ensures DynamoDB automatically deletes the lock record shortly after the batch window and processing *should* have completed, eliminating the need for explicit deletion logic for the lock itself.
-*   **Robustness:** This mechanism provides an effective, atomic, and self-maintaining way to achieve the "send trigger only once per batch window" requirement. 
+*   **Robustness:** This mechanism provides an effective, atomic, and self-maintaining way to achieve the "send trigger only once per batch window" requirement.
+
+## 6. TTL (Time To Live) Configuration
+
+*   **Attribute:** The `expires_at` attribute (Type: Number, containing Unix epoch seconds) is specifically defined and used for TTL.
+*   **Lambda Logic:** The `StagingLambda` calculates and writes this attribute with an expiry time shortly after the batch window (`W` + buffer).
+*   **Table Configuration (Required):** TTL **must** be explicitly enabled on the `conversations-trigger-lock` DynamoDB table via Infrastructure as Code (e.g., AWS SAM `template.yaml` or CloudFormation) for automatic cleanup.
+    ```yaml
+    # Example SAM/CloudFormation snippet within Table Properties:
+    TimeToLiveSpecification:
+      AttributeName: expires_at
+      Enabled: true
+    ```
+*   **Purpose:** This automatic deletion ensures that locks don't persist indefinitely if the explicit delete by the `MessagingLambda` fails, allowing new triggers after a reasonable period.
+
+## 7. Outcome & Benefits 

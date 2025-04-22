@@ -66,33 +66,52 @@ This document details the low-level design for the `messaging_lambda` function (
     *   Store the retrieved secret values (dictionaries) in `context_object['secrets'] = {'twilio': ..., 'openai': ...}`.
     *   *On Failure (Missing refs, Secret fetch error):* Log error, add SQS message ID to `batchItemFailures`, continue to next record.
 9.  **Process with AI (e.g., OpenAI):**
-    *   Extract necessary config/state from `context_object`: `openai_thread_id` (if exists), `assistant_id`, API key (from `context_object['secrets']['openai']`), `combined_body` (from `context_object['staging_table_merged_data']`).
-    *   Call AI service function (`openai_service.process_message_with_ai`), passing the thread ID and new user message (`combined_body`).
-    *   The service handles creating/using threads, adding messages, running the assistant.
-    *   **Result:** Assistant's response content, updated `thread_id`, token counts.
-    *   Store results in `context_object['open_ai_response'] = {'response_content': ..., 'thread_id': ..., 'prompt_tokens': ..., ...}`.
-    *   *On Failure (AI API error, Timeout):* Log error, add SQS message ID to `batchItemFailures`, continue to next record.
+    *   Extract necessary config/state from `context_object`: `openai_thread_id` (if exists), `assistant_id` (ensure it's the reply one, e.g., `assistant_id_replies`), API key (from `context_object['secrets']['openai']`), `combined_body` (from `context_object['staging_table_merged_data']`).
+    *   **Validate Inputs:** Check for missing `thread_id`, `assistant_id`, `combined_body`, or API key. *On Failure:* Log error, treat as `AI_INVALID_INPUT`, add SQS message ID to `batchItemFailures`, continue to next record.
+    *   Call AI service function (`openai_service.process_reply_with_ai`), passing the thread ID and new user message (`combined_body`).
+    *   The service handles creating/using threads, adding messages, running the assistant, and returns a tuple `(status_code, result_payload)`.
+    *   **Result (on SUCCESS):** `result_payload` contains assistant's response content, token counts. Store in `context_object['open_ai_response']`.
+    *   **Result (on TRANSIENT_ERROR):** Log warning. **Raise Exception** to trigger SQS retry.
+    *   **Result (on NON_TRANSIENT_ERROR / INVALID_INPUT from service):** Log error. Add SQS message ID to `batchItemFailures`, continue to next record.
 10. **Send Reply via Channel Provider (e.g., Twilio):**
     *   Extract necessary config/state from `context_object`: Twilio credentials (from `context_object['secrets']['twilio']`), recipient identifier (`primary_channel`), sender identifier (from `channel_config`).
     *   Extract AI response content from `context_object['open_ai_response']['response_content']`.
-    *   Call Channel Provider service function (`twilio_service.send_whatsapp_message`), passing credentials and response content.
-    *   **Result:** Sent message SID, status.
-    *   Store results in `context_object['twilio_response'] = {'message_sid': ..., 'status': ...}`.
-    *   *On Failure (Twilio API error, Invalid number):* Log error, add SQS message ID to `batchItemFailures`, continue to next record.
+    *   Call Channel Provider service function (`twilio_service.send_whatsapp_reply`), passing credentials and response content. Returns `(status_code, result_payload)`.
+    *   **Result (on SUCCESS):** Store `result_payload` (containing `message_sid`, `body`) in `context_object['twilio_response']`.
+    *   **Result (on TRANSIENT_ERROR):** Log warning. **Raise Exception** to trigger SQS retry.
+    *   **Result (on NON_TRANSIENT_ERROR / INVALID_INPUT):** Log error. Add SQS message ID to `batchItemFailures`, continue to next record.
 11. **Construct Final Message Maps:**
-    *   Create the **user message map** using data from `context_object['staging_table_merged_data']` and a current timestamp.
-    *   Create the **assistant message map** using data from `context_object['open_ai_response']`, `context_object['twilio_response']`, and a current timestamp.
+    *   Generate distinct UTC timestamps: `user_msg_ts` and `assistant_msg_ts`.
+    *   Create the **user message map** using `context_object['staging_table_merged_data']` (for `first_message_sid`, `combined_body`) and `user_msg_ts`.
+    *   Create the **assistant message map** using `context_object['twilio_response']` (for `message_sid`, `body`), `context_object['open_ai_response']` (for token counts), and `assistant_msg_ts`.
+    *   *On Failure (KeyError, etc.):* Log error, add SQS message ID to `batchItemFailures`, continue to next record.
 12. **Final Atomic Update (Append BOTH Messages):**
-    *   **Action:** Single `UpdateItem` on the `ConversationsTable`.
-    *   **Key:** `primary_channel` + `conversation_id`.
-    *   **UpdateExpression:** Uses `list_append` twice to append *both* the user message map *and* the assistant message map to the `messages` list attribute. Also updates `conversation_status` (to an idle state like 'reply_sent'), `updated_at`, `openai_thread_id`, `last_assistant_message_sid`, and token counts.
-    *   **ConditionExpression:** `conversation_status = :processing_reply` (ensures the lock acquired in Step 2 is still effectively held).
-    *   *On Failure (ConditionalCheckFailedException - unlikely here but possible, other DB error):* Log CRITICAL error (message sent but DB update failed), add SQS message ID to `batchItemFailures`, continue to next record.
+    *   **Pre-Check:** Check `hand_off_to_human` flag in `context_object['conversations_db_data']`. Log warning if true, but proceed with update (further handoff logic is separate).
+    *   **Calculate:** Determine `processing_time_ms` based on start/end times.
+    *   **Action:** Single `UpdateItem` on the `ConversationsTable` using `primary_channel` + `conversation_id` as key.
+    *   **UpdateExpression:** Uses `list_append` twice to append *both* the user map *and* the assistant map (created in Step 11) to `messages`. Also updates:
+        *   `conversation_status` (to an idle state like 'reply_sent').
+        *   `updated_at` (to current time).
+        *   `last_assistant_message_sid` (from assistant map).
+        *   Token counts (`prompt_tokens`, `completion_tokens`, `total_tokens` from assistant map).
+        *   `initial_processing_time_ms` (calculated duration).
+        *   `task_complete`, `hand_off_to_human`, `hand_off_to_human_reason` (using current values from `conversations_db_data` unless overridden by future logic).
+        *   Does **not** update `openai_thread_id` in this reply flow.
+    *   **ConditionExpression:** `conversation_status = :processing_reply`.
+    *   Call DB service function `update_conversation_after_reply`. Returns `(status_code, error_message)`.
+    *   **Result (on SUCCESS):** Log success. Proceed to Step 13 (Cleanup).
+    *   **Result (on DB_LOCK_LOST):** Log CRITICAL error (Message sent, lock lost before final update). **DO NOT** add to `batchItemFailures`. Continue to next record.
+    *   **Result (on DB_ERROR):** Log CRITICAL error (Message sent, DB update failed). **DO NOT** add to `batchItemFailures`. Continue to next record.
 13. **Cleanup Staging & Trigger-Lock (Post-Success):**
-    *   Only if Step 12 succeeds:
-        *   `BatchWriteItem` to delete all processed items (using keys from `staged_items` list) from `conversations-stage` table.
-        *   `DeleteItem` to remove the corresponding row (using `conversation_id`) from `conversations-trigger-lock` table.
-    *   *On Failure:* Log errors, but proceed (TTL will eventually clean up).
+    *   **Condition:** Only runs if Step 12 (Final Atomic Update) completed successfully.
+    *   **Action 1 (Staging Table):**
+        *   Extract keys (`conversation_id`, `message_sid`) from all items retrieved in `staged_items` (Step 4).
+        *   Call DB service function `cleanup_staging_table` with the list of keys.
+        *   This function uses `BatchWriteItem` with `DeleteRequest` for efficiency.
+    *   **Action 2 (Trigger Lock Table):**
+        *   Call DB service function `cleanup_trigger_lock` with the `conversation_id`.
+        *   This function uses `DeleteItem`.
+    *   **Error Handling:** Failures in cleanup functions are logged as warnings. Processing is *not* failed, as the main work is done. TTL is the fallback cleanup mechanism.
 14. **Release Processing Lock (Implicit via Step 12):** The `UpdateItem` in Step 12 changes the `conversation_status` away from `processing_reply`, effectively releasing the lock.
 15. **Lambda Message Success:**
     *   (Handled by reaching end of `try` block without adding to `batchItemFailures`).
