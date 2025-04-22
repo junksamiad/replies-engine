@@ -21,76 +21,186 @@ This document outlines the steps to deploy the WhatsApp Messaging Lambda (`src/m
         *   Secret key/value: Use **Plaintext** and structure it exactly as the code expects: `{"twilio_account_sid": "ACxxxxxxxxxxxx", "twilio_auth_token": "your_auth_token"}`.
         *   Secret name: Choose a descriptive name (e.g., `twilio-credentials-whatsapp`). Note this **Secret Name/ARN**.
 
-## Phase 2: Infrastructure Definition (IaC using SAM)
+## Phase 2: Package Lambda Code (Manual CLI)
 
-4.  **Locate/Create `template.yaml`:** Determine if a `template.yaml` file already exists at the root of the `replies-engine` project or within `src/messaging_lambda/whatsapp/`. If not, create one, likely at the project root.
-5.  **Define/Update SAM Template (`template.yaml`):** Add or modify the following resources within the template:
-    *   **Lambda Function (`AWS::Serverless::Function`):**
-        *   `Logical ID`: e.g., `WhatsAppMessagingLambda`
-        *   `CodeUri`: `src/messaging_lambda/whatsapp/lambda_pkg/`
-        *   `Handler`: `index.handler`
-        *   `Runtime`: `python3.11` (or `python3.12`, ensure compatibility with dependencies)
-        *   `Timeout`: `600` seconds (10 minutes - must be longer than the 540s OpenAI internal timeout).
-        *   `MemorySize`: `512` MB (Adjust based on testing if needed).
-        *   `Policies`: Define necessary IAM permissions. This is critical:
-            *   Allow `logs:CreateLogGroup`, `logs:CreateLogStream`, `logs:PutLogEvents` on CloudWatch Logs.
-            *   Allow `dynamodb:UpdateItem`, `dynamodb:Query`, `dynamodb:GetItem`, `dynamodb:BatchWriteItem`, `dynamodb:DeleteItem` on the specific `ConversationsTable`, `ConversationsStageTable`, and `ConversationsTriggerLockTable` ARNs.
-            *   Allow `sqs:ChangeMessageVisibility` on the specific `WhatsAppQueue` ARN (for the heartbeat).
-            *   Allow `secretsmanager:GetSecretValue` on the specific ARNs of the OpenAI and Twilio secrets created in Phase 1.
-        *   `Environment`:
-            *   `Variables`:
-                *   `CONVERSATIONS_TABLE`: Name of your conversations table.
-                *   `CONVERSATIONS_STAGE_TABLE`: Name of your staging table.
-                *   `CONVERSATIONS_TRIGGER_LOCK_TABLE`: Name of your trigger lock table.
-                *   `WHATSAPP_QUEUE_URL`: URL of your `WhatsAppQueue`.
-                *   `SQS_HEARTBEAT_INTERVAL_MS`: `300000` (5 minutes - or adjust as needed, must be less than queue visibility timeout).
-                *   `LOG_LEVEL`: `INFO` (or `DEBUG` for more verbose logs).
-                *   `AWS_REGION`: Your target AWS region (e.g., `eu-north-1`).
-    *   **Lambda Event Source Mapping (`Events` section within Function or separate `AWS::Lambda::EventSourceMapping`):**
-        *   `Type`: `SQS`
-        *   `Properties`:
-            *   `Queue`: ARN of the `WhatsAppQueue`.
-            *   `BatchSize`: `1` (Based on handover, process one SQS message/conversation trigger at a time).
-            *   `Enabled`: `True`
-    *   **DynamoDB Tables (Verify/Update):**
-        *   Check if `ConversationsStageTable` and `ConversationsTriggerLockTable` resources are defined *within this template*.
-        *   If they are, **ensure** the `TimeToLiveSpecification` property is correctly defined for both:
-            ```yaml
-            Properties:
-              TimeToLiveSpecification:
-                AttributeName: expires_at # Must match the attribute used in the table
-                Enabled: true
-            ```
-        *   If these tables are defined in a *different* SAM template (e.g., a shared resources template or the template for the first lambda), you'll need to update *that* template to include the TTL specification. **This TTL configuration is critical for automatic cleanup.**
-    *   **SQS Queue (Verify):** Ensure the `WhatsAppQueue` exists and you have its ARN/URL. If it's defined in this template, reference it using `!Ref` or `!GetAtt QueueArn`. If defined elsewhere, you'll need the explicit ARN/URL.
+4.  **Navigate to Lambda Code Directory:**
+    ```bash
+    cd src/messaging_lambda/whatsapp/lambda_pkg/
+    ```
+5.  **Install Dependencies Locally:** Create a package directory and install dependencies into it.
+    ```bash
+    mkdir package
+    pip install --target ./package -r ../requirements.txt
+    ```
+6.  **Prepare Deployment Package:** Copy the Lambda code into the package directory.
+    ```bash
+    cp -r ./* ./package/
+    ```
+7.  **Create Zip File:** Navigate into the package directory and zip its contents.
+    ```bash
+    cd package
+    zip -r ../whatsapp_messaging_lambda_deployment.zip .
+    cd .. # Go back to lambda_pkg directory
+    ```
+    *You will now have `whatsapp_messaging_lambda_deployment.zip` in the `src/messaging_lambda/whatsapp/` directory.* 
 
-## Phase 3: Build & Deploy
+## Phase 3: Create/Update AWS Resources (Manual CLI)
 
-6.  **Navigate:** Open your terminal in the directory containing the `template.yaml` file.
-7.  **Build:** Run `sam build --use-container`. This builds the Lambda deployment package inside a Docker container, ensuring dependencies are correctly packaged for the Lambda environment.
-8.  **Deploy:** Run `sam deploy --guided`.
-    *   Follow the prompts:
-        *   `Stack Name`: Choose a name (e.g., `replies-engine-messaging-lambda`).
-        *   `AWS Region`: Confirm your target region.
-        *   `Parameter EnvironmentVariables ...`: Confirm the environment variables are correct (it should pick them up from the template).
-        *   `Confirm changes before deploy`: Recommended `y`.
-        *   `Allow SAM CLI IAM role creation`: Likely `y`.
-        *   `Capabilities`: It will likely require `CAPABILITY_IAM`. Confirm `y`.
-        *   `Save arguments to configuration file`: `y` is convenient for future deployments.
-        *   `Deploy this changeset?`: `y`.
+*(Execute these commands from the project root directory or ensure paths in commands are adjusted)*
+
+8.  **Define IAM Role Name and Policy Name:** Choose unique names.
+    *   `ROLE_NAME="WhatsAppMessagingLambdaRole"`
+    *   `POLICY_NAME="WhatsAppMessagingLambdaPolicy"`
+9.  **Create Trust Policy JSON:** Create a file named `lambda-trust-policy.json` with the following content:
+    ```json
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "lambda.amazonaws.com"
+          },
+          "Action": "sts:AssumeRole"
+        }
+      ]
+    }
+    ```
+10. **Create IAM Role:** (Check if it exists first: `aws iam get-role --role-name $ROLE_NAME`)
+    ```bash
+    aws iam create-role --role-name $ROLE_NAME --assume-role-policy-document file://lambda-trust-policy.json
+    # Note the ARN from the output (e.g., "Arn": "arn:aws:iam::ACCOUNT_ID:role/WhatsAppMessagingLambdaRole")
+    # Export it for later use: export ROLE_ARN="arn:aws:iam::ACCOUNT_ID:role/WhatsAppMessagingLambdaRole"
+    ```
+11. **Define Permissions Policy JSON:** Create a file named `lambda-permissions-policy.json`. **Crucially, replace placeholders** with your actual Account ID, Region, Table Names, Queue ARN, and Secret ARNs.
+    ```json
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                ],
+                "Resource": "arn:aws:logs:YOUR_REGION:YOUR_ACCOUNT_ID:log-group:/aws/lambda/WhatsAppMessagingLambda*:*"
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "dynamodb:UpdateItem",
+                    "dynamodb:Query",
+                    "dynamodb:GetItem",
+                    "dynamodb:BatchWriteItem",
+                    "dynamodb:DeleteItem"
+                ],
+                "Resource": [
+                    "arn:aws:dynamodb:YOUR_REGION:YOUR_ACCOUNT_ID:table/YOUR_CONVERSATIONS_TABLE_NAME",
+                    "arn:aws:dynamodb:YOUR_REGION:YOUR_ACCOUNT_ID:table/YOUR_CONVERSATIONS_STAGE_TABLE_NAME",
+                    "arn:aws:dynamodb:YOUR_REGION:YOUR_ACCOUNT_ID:table/YOUR_CONVERSATIONS_TRIGGER_LOCK_TABLE_NAME"
+                ]
+            },
+            {
+                "Effect": "Allow",
+                "Action": "sqs:ChangeMessageVisibility",
+                "Resource": "YOUR_WHATSAPP_QUEUE_ARN"
+            },
+            {
+                "Effect": "Allow",
+                "Action": "secretsmanager:GetSecretValue",
+                "Resource": [
+                    "YOUR_OPENAI_SECRET_ARN",
+                    "YOUR_TWILIO_SECRET_ARN"
+                ]
+            }
+        ]
+    }
+    ```
+12. **Create/Update IAM Policy:** (Check if it exists: `aws iam get-policy --policy-arn arn:aws:iam::ACCOUNT_ID:policy/$POLICY_NAME`)
+    *   **If creating:**
+        ```bash
+        aws iam create-policy --policy-name $POLICY_NAME --policy-document file://lambda-permissions-policy.json
+        # Note the ARN: export POLICY_ARN="arn:aws:iam::ACCOUNT_ID:policy/$POLICY_NAME"
+        ```
+    *   **If updating (requires existing policy ARN):**
+        ```bash
+        # Get the default version ID first (e.g., v1, v2...)
+        # aws iam list-policy-versions --policy-arn $POLICY_ARN
+        # aws iam delete-policy-version --policy-arn $POLICY_ARN --version-id <OLD_VERSION_ID> # Optional: Delete old non-default versions if needed
+        aws iam create-policy-version --policy-arn $POLICY_ARN --policy-document file://lambda-permissions-policy.json --set-as-default
+        ```
+13. **Attach Policy to Role:**
+    ```bash
+    aws iam attach-role-policy --role-name $ROLE_NAME --policy-arn $POLICY_ARN
+    # Allow time for permissions to propagate (a few seconds)
+    ```
+14. **Define Lambda Environment Variables:** Prepare the variables needed. **Replace placeholders**.
+    ```bash
+    # Example - adjust values as needed
+    VARIABLES="{\
+CONVERSATIONS_TABLE='YOUR_CONVERSATIONS_TABLE_NAME',\
+CONVERSATIONS_STAGE_TABLE='YOUR_CONVERSATIONS_STAGE_TABLE_NAME',\
+CONVERSATIONS_TRIGGER_LOCK_TABLE='YOUR_CONVERSATIONS_TRIGGER_LOCK_TABLE_NAME',\
+WHATSAPP_QUEUE_URL='YOUR_WHATSAPP_QUEUE_URL',\
+SQS_HEARTBEAT_INTERVAL_MS='300000',\
+LOG_LEVEL='INFO',\
+AWS_REGION='YOUR_REGION'
+}"
+    ```
+15. **Create/Update Lambda Function:** (Check if it exists: `aws lambda get-function --function-name WhatsAppMessagingLambda`)
+    *   **If creating:**
+        ```bash
+        aws lambda create-function --function-name WhatsAppMessagingLambda \
+        --runtime python3.11 \
+        --role $ROLE_ARN \
+        --handler index.handler \
+        --zip-file fileb://src/messaging_lambda/whatsapp/whatsapp_messaging_lambda_deployment.zip \
+        --environment "Variables=$VARIABLES" \
+        --timeout 600 \
+        --memory-size 512
+        # Note the Function ARN
+        ```
+    *   **If updating:**
+        ```bash
+        aws lambda update-function-code --function-name WhatsAppMessagingLambda \
+        --zip-file fileb://src/messaging_lambda/whatsapp/whatsapp_messaging_lambda_deployment.zip
+
+        aws lambda update-function-configuration --function-name WhatsAppMessagingLambda \
+        --environment "Variables=$VARIABLES" \
+        --runtime python3.11 \
+        --role $ROLE_ARN \
+        --handler index.handler \
+        --timeout 600 \
+        --memory-size 512
+        ```
+16. **Create SQS Event Source Mapping:** (Check if mapping exists: `aws lambda list-event-source-mappings --function-name WhatsAppMessagingLambda --event-source-arn YOUR_WHATSAPP_QUEUE_ARN`)
+    *   **If creating:**
+        ```bash
+        aws lambda create-event-source-mapping --function-name WhatsAppMessagingLambda \
+        --event-source-arn YOUR_WHATSAPP_QUEUE_ARN \
+        --batch-size 1 \
+        --enabled
+        ```
+    *   **If updating (requires mapping UUID):**
+        ```bash
+        aws lambda update-event-source-mapping --uuid YOUR_MAPPING_UUID \
+        --batch-size 1 \
+        --enabled
+        ```
 
 ## Phase 4: Post-Deployment Verification
 
-9.  **AWS Console Checks:**
+17. **AWS Console Checks:**
     *   Go to the Lambda console, find the `WhatsAppMessagingLambda` function.
-    *   Verify the Environment Variables are set correctly under the 'Configuration' tab.
-    *   Check the 'Triggers' tab to ensure the SQS queue trigger is present and enabled.
-    *   Go to the SQS console, find `WhatsAppQueue`, check its configuration (especially the default visibility timeout - should be >= 10 minutes to accommodate Lambda execution and OpenAI processing).
+    *   Verify the Environment Variables are set correctly under the 'Configuration' -> 'Environment variables' tab.
+    *   Check the 'Configuration' -> 'Triggers' tab to ensure the SQS queue trigger is present and enabled.
+    *   Go to the SQS console, find `WhatsAppQueue`, check its configuration (especially the default visibility timeout - should be >= 10 minutes).
     *   Go to the DynamoDB console, check the `ConversationsStageTable` and `ConversationsTriggerLockTable` and verify TTL is enabled on the `expires_at` attribute under 'Table details' -> 'Additional settings'.
 
 ## Phase 5: End-to-End Test
 
-10. **Prepare Test Data:**
+18. **Prepare Test Data:**
     *   **DynamoDB (`ConversationsTable`):** Manually create or update an item representing the test conversation. Ensure it has:
         *   Correct `primary_channel` (user's WhatsApp number, e.g., `whatsapp:+1...`) and `conversation_id`.
         *   `conversation_status` is *not* equal to `processing_reply` (e.g., `template_sent` or `retry`).
@@ -104,7 +214,7 @@ This document outlines the steps to deploy the WhatsApp Messaging Lambda (`src/m
         *   `received_at` (ISO 8601 timestamp).
         *   `body` (The content of the simulated incoming user message parts).
         *   `expires_at` (A Unix timestamp in the future, e.g., `$(date -v+1H +%s)`).
-11. **Trigger Lambda:**
+19. **Trigger Lambda:**
     *   Go to the SQS console for `WhatsAppQueue`.
     *   Click "Send and receive messages".
     *   In the "Message body", enter the trigger message JSON, matching the `conversation_id` and `primary_channel` used in the DynamoDB records:
@@ -115,8 +225,8 @@ This document outlines the steps to deploy the WhatsApp Messaging Lambda (`src/m
         }
         ```
     *   Click "Send message".
-12. **Monitor & Verify:**
-    *   **CloudWatch Logs:** Immediately check the log group for `/aws/lambda/WhatsAppMessagingLambda` (or similar name based on deployment). Look for logs indicating processing steps, potential errors, heartbeat activity, and final success/failure.
+20. **Monitor & Verify:**
+    *   **CloudWatch Logs:** Immediately check the log group for `/aws/lambda/WhatsAppMessagingLambda`. Look for logs indicating processing steps, potential errors, heartbeat activity, and final success/failure.
     *   **Twilio Console:** Check your Twilio Programmable Messaging logs to see if an outbound WhatsApp message was attempted/sent to the `primary_channel`.
     *   **DynamoDB (`ConversationsTable`):** Refresh the test item. Verify:
         *   `messages` list has new 'user' and 'assistant' entries appended.
@@ -128,7 +238,7 @@ This document outlines the steps to deploy the WhatsApp Messaging Lambda (`src/m
 
 ## Phase 6: Monitoring Setup
 
-13. **CloudWatch Alarms:**
+21. **CloudWatch Alarms:**
     *   Create Metric Filters on the Lambda's log group to capture CRITICAL errors (e.g., filter for `CRITICAL`).
     *   Create CloudWatch Alarms based on these Metric Filters (e.g., alarm if the count > 0 in 5 minutes). Configure the alarm to notify an SNS topic for alerts.
     *   Consider alarms on standard Lambda metrics like `Errors` and `Throttles`.
