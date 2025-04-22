@@ -1,0 +1,46 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+            ],
+            "Resource": "arn:aws:logs:eu-north-1:337909745089:log-group:/aws/lambda/WhatsAppMessagingLambda-test:*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "dynamodb:GetItem",
+                "dynamodb:UpdateItem",
+                "dynamodb:Query",
+                "dynamodb:BatchWriteItem",
+                "dynamodb:DeleteItem"
+            ],
+            "Resource": [
+                "arn:aws:dynamodb:eu-north-1:337909745089:table/ai-multi-comms-conversations-dev",
+                "arn:aws:dynamodb:eu-north-1:337909745089:table/conversations-stage-test",
+                "arn:aws:dynamodb:eu-north-1:337909745089:table/conversations-trigger-lock-test"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "sqs:ReceiveMessage",
+                "sqs:DeleteMessage",
+                "sqs:GetQueueAttributes"
+            ],
+            "Resource": "arn:aws:sqs:eu-north-1:337909745089:ai-multi-comms-replies-whatsapp-queue-test"
+        },
+        {
+            "Effect": "Allow",
+            "Action": "secretsmanager:GetSecretValue",
+            "Resource": [
+                "arn:aws:secretsmanager:eu-north-1:337909745089:secret:ai-multi-comms/whatsapp-credentials/cucumber-recruitment/clarify-cv/twilio-dev-g5uk8r",
+                "arn:aws:secretsmanager:eu-north-1:337909745089:secret:ai-multi-comms/openai-api-key/whatsapp-dev-6T0fIo"
+            ]
+        }
+    ]
+} 
