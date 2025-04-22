@@ -315,7 +315,28 @@ def handler(event, context):
             twilio_creds = context_object.get('secrets', {}).get('twilio')
             recipient_num = primary_channel # Already extracted
             sender_num = context_object.get('conversations_db_data', {}).get('channel_config', {}).get('whatsapp', {}).get('company_whatsapp_number')
-            reply_content = context_object.get('open_ai_response', {}).get('response_content')
+            
+            # Get the raw response string from AI
+            raw_reply_content = context_object.get('open_ai_response', {}).get('response_content')
+
+            # --- ADDED: Parse JSON and Extract Content --- #
+            final_reply_body = None
+            if raw_reply_content:
+                try:
+                    parsed_response = json.loads(raw_reply_content)
+                    if isinstance(parsed_response, dict) and 'content' in parsed_response:
+                        final_reply_body = parsed_response['content']
+                        logger.info("Successfully parsed AI response and extracted content.")
+                        logger.debug(f"Extracted final reply body: {final_reply_body[:200]}...")
+                    else:
+                        logger.error(f"Parsed AI response is not a dict or missing 'content' key. Raw: {raw_reply_content[:500]}")
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse AI response as JSON: {e}. Raw: {raw_reply_content[:500]}")
+                except Exception as e:
+                    logger.exception(f"Unexpected error parsing AI response: {e}. Raw: {raw_reply_content[:500]}")
+            else:
+                 logger.error("Missing AI response content ('response_content') in context object.")
+            # --- END ADDED --- #
 
             # Validate required Twilio inputs
             if not twilio_creds or 'twilio_account_sid' not in twilio_creds or 'twilio_auth_token' not in twilio_creds:
@@ -326,18 +347,20 @@ def handler(event, context):
                  logger.error(f"Missing Twilio sender number (company_whatsapp_number) in config for {conversation_id}. Cannot send reply.")
                  batch_item_failures.append({"itemIdentifier": message_id})
                  continue
-            if not reply_content:
-                 logger.error(f"Missing AI response content to send for {conversation_id}. Cannot send reply.")
+            # --- MODIFIED: Check final_reply_body instead of raw_reply_content --- #
+            if not final_reply_body:
+                 logger.error(f"Missing or failed to extract final reply body from AI response for {conversation_id}. Cannot send reply.")
                  batch_item_failures.append({"itemIdentifier": message_id})
                  continue
             # recipient_num (primary_channel) was validated earlier
 
             # Call the Twilio service function
+            # --- MODIFIED: Use final_reply_body --- #
             twilio_status, twilio_result_payload = twilio_service.send_whatsapp_reply(
                 twilio_creds=twilio_creds,
                 recipient_number=recipient_num,
                 sender_number=sender_num,
-                message_body=reply_content
+                message_body=final_reply_body
             )
 
             # Handle Twilio processing results
