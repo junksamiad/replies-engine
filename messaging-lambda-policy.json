@@ -38,8 +38,8 @@
             "Effect": "Allow",
             "Action": "secretsmanager:GetSecretValue",
             "Resource": [
-                "arn:aws:secretsmanager:eu-north-1:337909745089:secret:ai-multi-comms/whatsapp-credentials/cucumber-recruitment/clarify-cv/twilio-dev-g5uk8r",
-                "arn:aws:secretsmanager:eu-north-1:337909745089:secret:ai-multi-comms/openai-api-key/whatsapp-dev-6T0fIo"
+                "arn:aws:secretsmanager:eu-north-1:337909745089:secret:ai-multi-comms/whatsapp-credentials/*/*/twilio-dev-*",
+                "arn:aws:secretsmanager:eu-north-1:337909745089:secret:ai-multi-comms/openai-api-key/whatsapp-dev-*"
             ]
         }
     ]

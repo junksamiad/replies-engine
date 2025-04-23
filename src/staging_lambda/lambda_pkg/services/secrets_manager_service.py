@@ -2,6 +2,7 @@ import boto3
 import json
 import logging
 import os
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO').upper())
@@ -49,22 +50,30 @@ def get_twilio_auth_token(secret_id):
             logger.warning(f"Secret {secret_id} does not contain a SecretString.")
             return None
 
-    except client.exceptions.ResourceNotFoundException:
-        logger.error(f"Secret not found: {secret_id}")
-        return None
-    except client.exceptions.InvalidParameterException as e:
-        logger.error(f"Invalid parameter for secret {secret_id}: {e}")
-        return None
-    except client.exceptions.InvalidRequestException as e:
-        logger.error(f"Invalid request for secret {secret_id}: {e}")
-        return None
-    except client.exceptions.DecryptionFailure as e:
-        logger.error(f"Secrets Manager decryption failure for {secret_id}: {e}")
-        return None
-    except client.exceptions.InternalServiceError as e:
-        logger.error(f"Secrets Manager internal service error for {secret_id}: {e}")
-        # Consider this potentially transient? Might need retry logic depending on requirements.
-        return None
+    except ClientError as e: # Catch generic ClientError
+        error_code = e.response.get('Error', {}).get('Code') # Get code from response
+        logger.error(f"Secrets Manager ClientError retrieving secret {secret_id}: {error_code} - {e}")
+
+        # Check specific codes
+        if error_code == 'ResourceNotFoundException':
+            return None
+        elif error_code == 'InvalidParameterException':
+            logger.error(f"Invalid parameter for secret {secret_id}: {e}") # Log specific message
+            return None
+        elif error_code == 'InvalidRequestException':
+            logger.error(f"Invalid request for secret {secret_id}: {e}")
+            return None
+        elif error_code == 'DecryptionFailure':
+            logger.error(f"Secrets Manager decryption failure for {secret_id}: {e}")
+            return None
+        elif error_code == 'InternalServiceError':
+            logger.error(f"Secrets Manager internal service error for {secret_id}: {e}")
+            # Consider this potentially transient? Might need retry logic depending on requirements.
+            return None
+        else:
+             # Log unhandled AWS error codes
+             logger.error(f"Unhandled Secrets Manager ClientError code '{error_code}' for secret {secret_id}: {e}")
+             return None
     except json.JSONDecodeError:
         logger.error(f"Failed to parse JSON secret string for {secret_id}")
         return None

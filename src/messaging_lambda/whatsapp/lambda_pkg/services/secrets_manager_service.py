@@ -95,7 +95,7 @@ def get_secret(secret_id: str) -> Tuple[str, Optional[Dict[str, Any]]]:
             return SECRET_PERMANENT_ERROR, None
         else:
             # Treat other specific AWS errors as potentially permanent unless known otherwise
-            logger.exception(f"Unhandled Secrets Manager ClientError retrieving secret {secret_id}")
+            logger.error(f"Unhandled Secrets Manager ClientError code '{error_code}' retrieving secret {secret_id}")
             return SECRET_PERMANENT_ERROR, None
 
     except Exception as e:
