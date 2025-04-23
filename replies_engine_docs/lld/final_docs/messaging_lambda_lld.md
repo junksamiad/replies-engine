@@ -60,13 +60,19 @@ This document details the low-level design for the `messaging_lambda` function (
     *   **Result:** The full conversation record dictionary.
     *   Store the result in `context_object['conversations_db_data']`.
     *   *On Failure (DB Error, Item Not Found):* Log error, add SQS message ID to `batchItemFailures`, continue to next record.
+
+    *   **Note on Data Structure:** The `ai_config` and `channel_config` maps retrieved in this step from the `ConversationsTable` contain *only* the configuration specific to the `primary_channel` of this conversation (e.g., the WhatsApp config). This structure is potentially different from the fully nested configuration stored in the main `CompanyDataTable`, as the upstream service (e.g., `template-sender-engine`) likely extracts only the relevant channel's config when creating the conversation record. This must be considered when accessing keys within these maps.
+
 8.  **Fetch Secrets:**
-    *   Extract `whatsapp_credentials_id` and `ai_api_key_reference` from `context_object['conversations_db_data']['channel_config']` and `...['ai_config']`.
+    *   Extract `whatsapp_credentials_id` (directly from `context_object['conversations_db_data']['channel_config']`) and `api_key_reference` (directly from `context_object['conversations_db_data']['ai_config']`) using the understanding that these maps contain the channel-specific configuration for this conversation.
     *   Call Secrets Manager service (`secrets_manager_service.get_secret`) for both references.
     *   Store the retrieved secret values (dictionaries) in `context_object['secrets'] = {'twilio': ..., 'openai': ...}`.
     *   *On Failure (Missing refs, Secret fetch error):* Log error, add SQS message ID to `batchItemFailures`, continue to next record.
+
+    *   **Comparison with Staging Lambda:** Note that the `StagingLambda` retrieves the credential reference (e.g., `whatsapp_credentials_id`) differently. It typically uses a GSI query projecting *only* the `channel_config` attribute and extracts the necessary key directly from that limited result for signature validation, without needing the `ai_config` at that stage.
+
 9.  **Process with AI (e.g., OpenAI):**
-    *   Extract necessary config/state from `context_object`: `openai_thread_id` (if exists), `assistant_id` (ensure it's the reply one, e.g., `assistant_id_replies`), API key (from `context_object['secrets']['openai']`), `combined_body` (from `context_object['staging_table_merged_data']`).
+    *   Extract necessary config/state from `context_object`: `openai_thread_id` (if exists), `assistant_id` (specifically `assistant_id_replies` read directly from `context_object['conversations_db_data']['ai_config']`), API key (from `context_object['secrets']['openai']`), `combined_body` (from `context_object['staging_table_merged_data']`).
     *   **Validate Inputs:** Check for missing `thread_id`, `assistant_id`, `combined_body`, or API key. *On Failure:* Log error, treat as `AI_INVALID_INPUT`, add SQS message ID to `batchItemFailures`, continue to next record.
     *   Call AI service function (`openai_service.process_reply_with_ai`), passing the thread ID and new user message (`combined_body`).
     *   The service handles creating/using threads, adding messages, running the assistant, and returns a tuple `(status_code, result_payload)`.

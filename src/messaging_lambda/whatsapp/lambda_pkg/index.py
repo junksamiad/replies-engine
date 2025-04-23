@@ -194,12 +194,10 @@ def handler(event, context):
 
             # Extract refs from hydrated DB data
             db_data = context_object.get('conversations_db_data', {})
-            ai_config = db_data.get('ai_config', {})
-            channel_config = db_data.get('channel_config', {})
-            whatsapp_ai_config = ai_config.get('openai_config', {}).get('whatsapp', {})
-            whatsapp_channel_config = channel_config.get('whatsapp', {})
-            openai_secret_ref = whatsapp_ai_config.get('api_key_reference')
-            twilio_secret_ref = whatsapp_channel_config.get('whatsapp_credentials_id')
+            ai_config = db_data.get('ai_config', {}) # This map is now the channel-specific config
+            channel_config = db_data.get('channel_config', {}) # This map contains channel config
+            openai_secret_ref = ai_config.get('api_key_reference')
+            twilio_secret_ref = channel_config.get('whatsapp_credentials_id')
 
             # --- Fetch OpenAI Secret --- #
             if not openai_secret_ref:
@@ -258,8 +256,8 @@ def handler(event, context):
             logger.info(f"Starting AI processing for conversation {conversation_id}...")
 
             # Extract necessary inputs for AI service
-            ai_input_thread_id = context_object.get('conversations_db_data', {}).get('openai_thread_id')
-            ai_input_assistant_id = context_object.get('conversations_db_data', {}).get('ai_config', {}).get('openai_config', {}).get('whatsapp', {}).get('assistant_id_replies')
+            ai_input_thread_id = context_object.get('conversations_db_data', {}).get('thread_id')
+            ai_input_assistant_id = ai_config.get('assistant_id_replies')
             ai_input_user_message = context_object.get('staging_table_merged_data', {}).get('combined_body')
             openai_creds = context_object.get('secrets', {}).get('openai')
             ai_input_api_key = openai_creds.get('ai_api_key') if openai_creds else None
@@ -314,7 +312,7 @@ def handler(event, context):
             # Extract necessary inputs for Twilio service
             twilio_creds = context_object.get('secrets', {}).get('twilio')
             recipient_num = primary_channel # Already extracted
-            sender_num = context_object.get('conversations_db_data', {}).get('channel_config', {}).get('whatsapp', {}).get('company_whatsapp_number')
+            sender_num = channel_config.get('company_whatsapp_number')
             
             # Get the raw response string from AI
             raw_reply_content = context_object.get('open_ai_response', {}).get('response_content')

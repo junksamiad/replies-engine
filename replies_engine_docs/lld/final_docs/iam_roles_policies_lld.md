@@ -129,7 +129,12 @@ MessagingLambdaRole:
               Action:
                 - secretsmanager:GetSecretValue
               Resource:
-                - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectPrefix}/whatsapp-credentials/*/*/twilio-*'
+                # Use patterns including environment suffix and trailing wildcard (-*)
+                - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectPrefix}/whatsapp-credentials/*/*/twilio-${EnvironmentName}-*'
+                - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectPrefix}/openai-api-key/whatsapp-${EnvironmentName}-*'
+                # Add patterns for other channels (sms, email) if this role needs them
+                # - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectPrefix}/sms-credentials/*/*/twilio-${EnvironmentName}-*'
+                # - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectPrefix}/email-credentials/*/*/sendgrid-${EnvironmentName}-*'
 ```
 
 ## 3. Policy Details and Rationale

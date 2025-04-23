@@ -15,6 +15,9 @@ logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO').upper())
 LOCK_ACQUIRED = "ACQUIRED"
 LOCK_EXISTS = "EXISTS"
 DB_ERROR = "DB_ERROR"
+# ADDED Module-level status codes for update function
+DB_SUCCESS = "SUCCESS" 
+DB_LOCK_LOST = "LOCK_LOST"
 
 # Define the status value used for locking
 PROCESSING_STATUS = "processing_reply"
@@ -207,10 +210,10 @@ def update_conversation_after_reply(
         A tuple: (status_code, error_message)
         Status codes: DB_SUCCESS, DB_LOCK_LOST (ConditionalCheckFailed), DB_ERROR
     """
-    # Status codes defined here for clarity within function scope
-    DB_SUCCESS = "SUCCESS"
-    DB_LOCK_LOST = "LOCK_LOST"
-    DB_ERROR = "DB_ERROR"
+    # Status codes defined here for clarity within function scope - REMOVED LOCAL DEFINITIONS
+    # DB_SUCCESS = "SUCCESS"
+    # DB_LOCK_LOST = "LOCK_LOST"
+    # DB_ERROR = "DB_ERROR" - This one is already a module constant
 
     if not conversations_table:
         logger.error("DynamoDB conversations table not initialized. Cannot update record.")

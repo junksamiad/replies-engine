@@ -104,10 +104,18 @@ def parse_incoming_request(event):
         context_object['to'] = parsed_body.get('To')
         context_object['message_sid'] = parsed_body.get('MessageSid') # Useful for idempotency/logging
         context_object['account_sid'] = parsed_body.get('AccountSid') # Might be useful
+        context_object['body'] = parsed_body.get('Body') # The actual message content
         # Derive conversation_id consistently (e.g., sorted numbers)
-        num1 = context_object['from'].split(':')[-1] # Get number part
-        num2 = context_object['to'].split(':')[-1]
-        context_object['conversation_id'] = f"conv_{'_'.join(sorted([num1, num2]))}"
+        # Ensure 'from' and 'to' exist before splitting (should be guaranteed by validation later)
+        from_num_part = context_object['from'].split(':')[-1] if context_object.get('from') else ''
+        to_num_part = context_object['to'].split(':')[-1] if context_object.get('to') else ''
+        # Handle potential empty strings if splitting failed
+        if from_num_part and to_num_part:
+            context_object['conversation_id'] = f"conv_{'_'.join(sorted([from_num_part, to_num_part]))}"
+        else:
+            # Fallback or error if numbers aren't present/valid - should ideally be caught by later validation
+            logger.warning("Could not derive conversation_id due to missing from/to numbers.")
+            context_object['conversation_id'] = None # Ensure it's None if derivation fails
 
     elif context_object['channel_type'] == 'email':
         # Populate essential email identifiers
@@ -118,9 +126,11 @@ def parse_incoming_request(event):
 
     # 6. Basic Validation (Essential IDs only)
     if context_object['channel_type'] in ['whatsapp', 'sms']:
-        required_keys = ['from', 'to', 'message_sid', 'conversation_id']
+        # UPDATED: Add 'body' to required keys for whatsapp/sms
+        required_keys = ['from', 'to', 'message_sid', 'body', 'conversation_id']
     elif context_object['channel_type'] == 'email':
-        required_keys = ['from_address', 'to_address', 'email_id', 'conversation_id']
+        # Add 'body' here too if required for email
+        required_keys = ['from_address', 'to_address', 'email_id', 'body', 'conversation_id']
     else:
         required_keys = []
 
