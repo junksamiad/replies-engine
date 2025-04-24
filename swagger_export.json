@@ -1,0 +1,109 @@
+{
+  "swagger" : "2.0",
+  "info" : {
+    "version" : "2025-04-21T06:00:13Z",
+    "title" : "ai-multi-comms-webhook-dev"
+  },
+  "host" : "fjvxpbzh6b.execute-api.eu-north-1.amazonaws.com",
+  "basePath" : "/test",
+  "schemes" : [ "https" ],
+  "paths" : {
+    "/whatsapp" : {
+      "post" : {
+        "consumes" : [ "application/x-www-form-urlencoded" ],
+        "produces" : [ "text/xml", "application/xml", "application/json" ],
+        "parameters" : [ {
+          "name" : "X-Twilio-Signature",
+          "in" : "header",
+          "required" : false,
+          "type" : "string"
+        }, {
+          "in" : "body",
+          "name" : "TwilioWebhookPayloadModel",
+          "required" : true,
+          "schema" : {
+            "$ref" : "#/definitions/TwilioWebhookPayloadModel"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "200 response",
+            "schema" : {
+              "$ref" : "#/definitions/Empty"
+            },
+            "headers" : {
+              "Content-Type" : {
+                "type" : "string"
+              }
+            }
+          }
+        }
+      },
+      "options" : {
+        "consumes" : [ "application/json" ],
+        "produces" : [ "application/json" ],
+        "responses" : {
+          "200" : {
+            "description" : "200 response",
+            "schema" : {
+              "$ref" : "#/definitions/Empty"
+            },
+            "headers" : {
+              "Access-Control-Allow-Origin" : {
+                "type" : "string"
+              },
+              "Access-Control-Allow-Methods" : {
+                "type" : "string"
+              },
+              "Access-Control-Allow-Headers" : {
+                "type" : "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "definitions" : {
+    "Empty" : {
+      "type" : "object",
+      "title" : "Empty Schema"
+    },
+    "TwilioWebhookPayloadModel" : {
+      "type" : "object",
+      "required" : [ "AccountSid", "Body", "From", "MessageSid", "To" ],
+      "properties" : {
+        "From" : {
+          "type" : "string",
+          "description" : "Sender phone number (e.g., whatsapp:+1...)"
+        },
+        "To" : {
+          "type" : "string",
+          "description" : "Recipient/Company Twilio number (e.g., whatsapp:+1...)"
+        },
+        "Body" : {
+          "type" : "string",
+          "description" : "Incoming message text"
+        },
+        "AccountSid" : {
+          "type" : "string",
+          "description" : "Twilio Account SID"
+        },
+        "MessageSid" : {
+          "type" : "string",
+          "description" : "Twilio Message SID"
+        }
+      },
+      "title" : "TwilioWebhookPayload"
+    }
+  },
+  "x-amazon-apigateway-policy" : {
+    "Version" : "2012-10-17",
+    "Statement" : [ {
+      "Effect" : "Allow",
+      "Principal" : "*",
+      "Action" : "execute-api:Invoke",
+      "Resource" : "arn:aws:execute-api:eu-north-1:337909745089:fjvxpbzh6b/*"
+    } ]
+  }
+}

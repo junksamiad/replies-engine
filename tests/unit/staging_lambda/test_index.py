@@ -2,7 +2,7 @@ import pytest
 import json
 from unittest.mock import patch, MagicMock, ANY
 
-# Use the correct absolute import path based on project structure
+# Move the import back to the top level now that env vars are handled by pytest-env
 from src.staging_lambda.lambda_pkg import index
 
 # --- Fixtures ---
@@ -288,4 +288,81 @@ def test_determine_error_other_channel_json(mock_rb):
     response = index._determine_final_error_response('email', error_code, "Inactive")
 
     mock_rb.create_error_response.assert_called_once_with(error_code, "Inactive")
-    assert response == expected_response 
+    assert response == expected_response
+
+# Example test structure (can likely be removed or adapted)
+@pytest.mark.parametrize(
+    "event_body, expected_status_code, expected_mock_calls",
+    [
+        # TODO: Add actual test cases here
+        ({"test": "data"}, 200, {"parse": 1, "validate": 1}),
+        ({}, 200, {"parse": 1, "validate": 0}), # Error case mapped to 200 TwiML
+    ]
+)
+def test_handler_logic(event_body, expected_status_code, expected_mock_calls, monkeypatch):
+    # Import inside the test function AFTER monkeypatch has run (via conftest.py)
+    # from src.staging_lambda.lambda_pkg import index
+
+    # --- Mock dependencies needed by the handler ---
+    # Use patch context managers or MagicMock for dependencies imported within the handler
+    # (parsing_utils, validation, routing, dynamodb_service, sqs_service, secrets_manager_service, response_builder)
+
+    mock_parsing = MagicMock()
+    mock_validation = MagicMock()
+    mock_routing = MagicMock()
+    mock_db = MagicMock()
+    mock_sqs = MagicMock()
+    mock_sm = MagicMock()
+    mock_response = MagicMock()
+
+    # Configure mock return values based on the test case if needed
+    mock_parsing.parse_incoming_request.return_value = {'success': True, 'context_object': {'channel_type': 'whatsapp', 'from': 'w:+1', 'to': 'w:+2', 'conversation_id': 'c1'}, 'signature_header': 'sig', 'request_url': 'url', 'parsed_body_params': {}}
+    mock_db.get_credential_ref_for_validation.return_value = {'status': 'FOUND', 'credential_ref': 'ref', 'conversation_id': 'c1'}
+    mock_sm.get_twilio_auth_token.return_value = 'token'
+    # Assume validation passes for success case
+    # Need RequestValidator mock? Or patch it out?
+    with patch('src.staging_lambda.lambda_pkg.index.RequestValidator') as MockValidator:
+        mock_validator_instance = MockValidator.return_value
+        mock_validator_instance.validate.return_value = True # Assume signature valid
+
+        mock_db.get_full_conversation.return_value = {'status': 'FOUND', 'data': {'some': 'data'}}
+        mock_validation.validate_conversation_rules.return_value = {'valid': True}
+        mock_routing.determine_target_queue.return_value = "dummy_queue_url"
+        mock_db.write_to_stage_table.return_value = 'SUCCESS'
+        mock_db.acquire_trigger_lock.return_value = 'ACQUIRED' # Or 'EXISTS'
+        mock_sqs.send_message_to_queue.return_value = 'SUCCESS'
+        mock_response.create_success_response_twiml.return_value = {'statusCode': 200, 'headers': {'Content-Type': 'text/xml'}, 'body': '<Response/>'}
+
+        # Patch the modules *within* the handler's scope
+        with patch.dict(index.__dict__, {
+            'parsing_utils': mock_parsing,
+            'validation': mock_validation,
+            'routing': mock_routing,
+            'dynamodb_service': mock_db,
+            'sqs_service': mock_sqs,
+            'secrets_manager_service': mock_sm,
+            'response_builder': mock_response,
+            # 'RequestValidator': MockValidator # Already patched above
+        }):
+
+            event = {
+                "headers": {"X-Twilio-Signature": "sig"},
+                "requestContext": {"http": {"sourceIp": "ip"}},
+                "body": json.dumps(event_body),
+                 "path": "/whatsapp" # Added path
+            }
+            context = None
+
+            # Call the actual handler
+            response = index.handler(event, context)
+
+            # Basic assertion on status code
+            assert response['statusCode'] == expected_status_code
+
+            # Example assertions on mock calls (adjust based on expected_mock_calls)
+            # assert mock_parsing.parse_incoming_request.call_count == expected_mock_calls['parse']
+            # assert mock_validation.validate_conversation_rules.call_count == expected_mock_calls['validate']
+            # ... add more specific assertions based on test cases ...
+
+# Add more test functions following the same pattern of importing inside
+# and mocking dependencies. 

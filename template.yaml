@@ -1,0 +1,575 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SAM template for the AI Multi-Comms Replies Engine, defining Lambda functions,
+  API Gateway, DynamoDB tables, SQS queues, IAM roles, and other resources
+  for handling incoming message replies.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    AllowedValues: [dev, prod]
+    Description: The environment name (dev or prod) used as a suffix for resource names and for selecting configurations.
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+    Description: Log level for Lambda functions.
+  RepliesProjectPrefix:
+    Type: String
+    Default: ai-multi-comms-replies
+    Description: Prefix for resources specific to the Replies Engine.
+  SharedProjectPrefix:
+    Type: String
+    Default: ai-multi-comms
+    Description: Prefix for shared resources (like main conversations table, SNS topic).
+  StagingLambdaMemory:
+    Type: Number
+    Default: 512
+    Description: Memory allocation for the Staging Lambda.
+  StagingLambdaTimeout:
+    Type: Number
+    Default: 60 # Should be relatively short
+    Description: Timeout in seconds for the Staging Lambda.
+  WhatsAppMessagingLambdaMemory:
+    Type: Number
+    Default: 1024 # Needs more memory for potential AI processing
+    Description: Memory allocation for the WhatsApp Messaging Lambda.
+  WhatsAppMessagingLambdaTimeout:
+    Type: Number
+    Default: 900 # Allow ample time for AI interaction and retries
+    Description: Timeout in seconds for the WhatsApp Messaging Lambda.
+  DynamoDBTTLAttributeName:
+    Type: String
+    Default: expires_at # Changed from ttl_timestamp based on LLD
+    Description: The attribute name used for DynamoDB Time To Live (TTL).
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 30 # Default timeout, overridden specifically where needed
+    MemorySize: 256 # Default memory, overridden specifically where needed
+    Environment:
+      Variables:
+        LOG_LEVEL: !Ref LogLevel
+        ENVIRONMENT_NAME: !Ref EnvironmentName
+        DYNAMODB_TTL_ATTRIBUTE: !Ref DynamoDBTTLAttributeName
+  Api:
+    Cors:
+      AllowMethods: "'POST,OPTIONS'"
+      AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+      AllowOrigin: "'*'" # Consider restricting for production
+
+Resources:
+  # --- SQS Queues (Replies Engine) ---
+  WhatsAppQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${RepliesProjectPrefix}-whatsapp-dlq-${EnvironmentName}'
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  WhatsAppQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${RepliesProjectPrefix}-whatsapp-queue-${EnvironmentName}'
+      VisibilityTimeout: !Ref WhatsAppMessagingLambdaTimeout # Match Lambda timeout + buffer? Consider 905
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WhatsAppQueueDLQ.Arn
+        maxReceiveCount: 3
+
+  EmailQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${RepliesProjectPrefix}-email-dlq-${EnvironmentName}'
+      MessageRetentionPeriod: 1209600
+
+  EmailQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${RepliesProjectPrefix}-email-queue-${EnvironmentName}'
+      VisibilityTimeout: 900 # Placeholder, adjust based on Email Lambda timeout
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EmailQueueDLQ.Arn
+        maxReceiveCount: 3
+
+  SmsQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${RepliesProjectPrefix}-sms-dlq-${EnvironmentName}'
+      MessageRetentionPeriod: 1209600
+
+  SmsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${RepliesProjectPrefix}-sms-queue-${EnvironmentName}'
+      VisibilityTimeout: 900 # Placeholder, adjust based on SMS Lambda timeout
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SmsQueueDLQ.Arn
+        maxReceiveCount: 3
+
+  HumanHandoffQueue: # No DLQ typically needed for handoff, depends on requirement
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${RepliesProjectPrefix}-human-handoff-queue-${EnvironmentName}'
+      # VisibilityTimeout: 300 # Default or adjust based on consumer
+
+  # --- DynamoDB Tables (Replies Engine) ---
+  ConversationsStageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${RepliesProjectPrefix}-conversations-stage-${EnvironmentName}'
+      AttributeDefinitions:
+        - AttributeName: conversation_id # PK based on LLD
+          AttributeType: S
+        - AttributeName: message_sid # SK based on LLD
+          AttributeType: S
+      KeySchema:
+        - AttributeName: conversation_id # PK based on LLD
+          KeyType: HASH
+        - AttributeName: message_sid # SK based on LLD
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: !Ref DynamoDBTTLAttributeName # Uses the updated parameter
+        Enabled: true
+
+  ConversationsTriggerLockTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${RepliesProjectPrefix}-conversations-trigger-lock-${EnvironmentName}'
+      AttributeDefinitions:
+        - AttributeName: conversation_id # PK based on LLD (was lock_id)
+          AttributeType: S
+      KeySchema:
+        - AttributeName: conversation_id # PK based on LLD
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: !Ref DynamoDBTTLAttributeName # Uses the updated parameter
+        Enabled: true
+
+  # --- IAM Role & Policy (Staging Lambda) ---
+  StagingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${RepliesProjectPrefix}-staging-role-${EnvironmentName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${RepliesProjectPrefix}-staging-policy-${EnvironmentName}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Basic Lambda Execution (CloudWatch Logs)
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${RepliesProjectPrefix}-staging-${EnvironmentName}:*'
+              # DynamoDB Permissions (SHARED Conversations Table - Read Only)
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query # Needed for GSI lookup (credential_ref)
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SharedProjectPrefix}-conversations-${EnvironmentName}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SharedProjectPrefix}-conversations-${EnvironmentName}/index/*' # Access all indexes
+              # DynamoDB Permissions (Stage & Lock Tables)
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem # Needed to check existing fragments?
+                  # - dynamodb:DeleteItem # If staging lambda cleans up old fragments?
+                Resource: !GetAtt ConversationsStageTable.Arn
+              - Effect: Allow
+                Action: # Lock acquisition/release/check
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt ConversationsTriggerLockTable.Arn
+              # SQS Permissions (Send to Channel & Handoff Queues)
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource:
+                  - !GetAtt WhatsAppQueue.Arn
+                  - !GetAtt EmailQueue.Arn
+                  - !GetAtt SmsQueue.Arn
+                  - !GetAtt HumanHandoffQueue.Arn
+              # Secrets Manager Permissions (Read Twilio Auth Token)
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  # Assuming WhatsApp channel for now - adjust if staging handles multiple channel validations
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SharedProjectPrefix}/whatsapp-credentials/*/*/twilio-${EnvironmentName}-*'
+
+  # --- IAM Role & Policy (WhatsApp Messaging Lambda) ---
+  WhatsAppMessagingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${RepliesProjectPrefix}-whatsapp-messaging-role-${EnvironmentName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${RepliesProjectPrefix}-whatsapp-messaging-policy-${EnvironmentName}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Basic Lambda Execution (CloudWatch Logs)
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${RepliesProjectPrefix}-whatsapp-messaging-${EnvironmentName}:*'
+              # SQS Permissions (Consume from WhatsApp Queue)
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  # - sqs:ChangeMessageVisibility # Add if using heartbeat utility
+                Resource: !GetAtt WhatsAppQueue.Arn
+              # DynamoDB Permissions (Main Conversations Table - SHARED)
+              - Effect: Allow
+                Action: # Read context, update status/history
+                  - dynamodb:Query
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:PutItem # If creating new items? Unlikely for replies.
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SharedProjectPrefix}-conversations-${EnvironmentName}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${SharedProjectPrefix}-conversations-${EnvironmentName}/index/*' # Access all indexes
+              # DynamoDB Permissions (Stage Table - Read/Delete fragments)
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query # To find all fragments for a request_id
+                  - dynamodb:GetItem # Get individual fragments?
+                  - dynamodb:BatchWriteItem # Efficiently delete fragments
+                  - dynamodb:DeleteItem # Delete single items if needed
+                Resource: !GetAtt ConversationsStageTable.Arn
+              # DynamoDB Permissions (Lock Table - Check/Release Lock)
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem # e.g., extend lock lease
+                  - dynamodb:DeleteItem # Release lock
+                Resource: !GetAtt ConversationsTriggerLockTable.Arn
+              # Secrets Manager Permissions (SHARED - Read OpenAI & Twilio secrets)
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  # OpenAI channel-specific API key (WhatsApp)
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SharedProjectPrefix}/openai-api-key/whatsapp-${EnvironmentName}-*'
+                  # WhatsApp channel credentials (Twilio)
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SharedProjectPrefix}/whatsapp-credentials/*/*/twilio-${EnvironmentName}-*'
+                  # Add other channel secrets here when needed (e.g., Email/SendGrid, SMS/Twilio)
+
+  # --- Lambda Functions ---
+  StagingLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${RepliesProjectPrefix}-staging-${EnvironmentName}'
+      CodeUri: src/staging_lambda/
+      Handler: lambda_pkg.index.handler
+      Role: !GetAtt StagingLambdaRole.Arn
+      MemorySize: !Ref StagingLambdaMemory
+      Timeout: !Ref StagingLambdaTimeout
+      Environment:
+        Variables:
+          CONVERSATIONS_TABLE_NAME: !Sub '${SharedProjectPrefix}-conversations-${EnvironmentName}'
+          STAGE_TABLE_NAME: !Ref ConversationsStageTable
+          LOCK_TABLE_NAME: !Ref ConversationsTriggerLockTable
+          WHATSAPP_QUEUE_URL: !Ref WhatsAppQueue
+          EMAIL_QUEUE_URL: !Ref EmailQueue
+          SMS_QUEUE_URL: !Ref SmsQueue
+          HANDOFF_QUEUE_URL: !Ref HumanHandoffQueue
+    Metadata:
+      BuildMethod: python3.11
+    Events:
+      ApiEvent:
+        Type: Api
+        Properties:
+          RestApiId: !Ref RepliesWebhookApi
+          Path: /whatsapp
+          Method: POST
+
+  # Add explicit permission for API Gateway to invoke Staging Lambda
+  StagingLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref StagingLambdaFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RepliesWebhookApi}/*/*' # Allow any method/path on this API stage
+
+  WhatsAppMessagingLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${RepliesProjectPrefix}-whatsapp-messaging-${EnvironmentName}'
+      CodeUri: src/messaging_lambda/whatsapp/
+      Handler: lambda_pkg.index.handler
+      Role: !GetAtt WhatsAppMessagingLambdaRole.Arn
+      MemorySize: !Ref WhatsAppMessagingLambdaMemory
+      Timeout: !Ref WhatsAppMessagingLambdaTimeout
+      Environment:
+        Variables:
+          CONVERSATIONS_TABLE: !Sub '${SharedProjectPrefix}-conversations-${EnvironmentName}' # Shared Table
+          CONVERSATIONS_STAGE_TABLE: !Ref ConversationsStageTable # Key expected by Messaging Lambda
+          CONVERSATIONS_TRIGGER_LOCK_TABLE: !Ref ConversationsTriggerLockTable # Key expected by Messaging Lambda
+          WHATSAPP_QUEUE_URL: !Ref WhatsAppQueue # Queue it consumes
+          SECRETS_MANAGER_REGION: !Ref AWS::Region
+          # SQS_HEARTBEAT_INTERVAL_MS: "300000" # Add if using heartbeat
+          # VERSION: !Sub 'whatsapp-msg-${EnvironmentName}-1.0.0' # Add versioning later
+      # Events: # REMOVED - Will define EventSourceMapping explicitly below
+        # SQSEvent:
+        #   Type: SQS
+        #   Properties:
+        #     Queue: !GetAtt WhatsAppQueue.Arn
+        #     BatchSize: 1 # Process one reply message at a time
+        #     Enabled: true
+    Metadata:
+      BuildMethod: python3.11 # Necessary because requirements.txt is in CodeUri subdir
+
+  # --- Explicit Event Source Mapping (SQS -> WhatsApp Lambda) ---
+  WhatsAppMessagingLambdaEventSourceMapping:
+      Type: AWS::Lambda::EventSourceMapping
+      Properties:
+          BatchSize: 1
+          Enabled: true
+          EventSourceArn: !GetAtt WhatsAppQueue.Arn
+          FunctionName: !Ref WhatsAppMessagingLambdaFunction
+          # MaximumBatchingWindowInSeconds: 0 # Optional
+
+  # --- REST API Gateway (using AWS::Serverless::Api) ---
+  RepliesWebhookApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub '${RepliesProjectPrefix}-webhook-api-${EnvironmentName}'
+      StageName: !Ref EnvironmentName
+      DefinitionBody:
+        swagger: '2.0'
+        info:
+          title: !Sub '${RepliesProjectPrefix}-webhook-api-${EnvironmentName}'
+        basePath: !Sub '/${EnvironmentName}'
+        schemes: [https]
+        paths:
+          /whatsapp:
+            post:
+              consumes:
+                - application/x-www-form-urlencoded
+              produces:
+                - application/json
+              x-amazon-apigateway-integration:
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${StagingLambdaFunction.Arn}/invocations'
+                httpMethod: POST
+                type: aws_proxy
+                passthroughBehavior: WHEN_NO_MATCH
+            options:
+              produces:
+                - application/json
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode": 200}'
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+                      method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+              responses:
+                "200":
+                  description: "CORS configuration response"
+                  headers:
+                    Access-Control-Allow-Headers:
+                      type: string
+                    Access-Control-Allow-Methods:
+                      type: string
+                    Access-Control-Allow-Origin:
+                      type: string
+
+          /email: # Placeholder path
+            post:
+              produces: ["application/json"]
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode": 200}'
+                responses:
+                  default:
+                    statusCode: '200'
+              responses: {}
+            options:
+              produces: ["application/json"]
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode": 200}'
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+                      method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+              responses:
+                "200":
+                  description: "CORS configuration response"
+                  headers:
+                    Access-Control-Allow-Headers:
+                      type: string
+                    Access-Control-Allow-Methods:
+                      type: string
+                    Access-Control-Allow-Origin:
+                      type: string
+
+          /sms: # Placeholder path
+            post:
+              produces: ["application/json"]
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode": 200}'
+                responses:
+                  default:
+                    statusCode: '200'
+              responses: {}
+            options:
+              produces: ["application/json"]
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode": 200}'
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+                      method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+              responses:
+                "200":
+                  description: "CORS configuration response"
+                  headers:
+                    Access-Control-Allow-Headers:
+                      type: string
+                    Access-Control-Allow-Methods:
+                      type: string
+                    Access-Control-Allow-Origin:
+                      type: string
+
+  # --- Log Groups ---
+  StagingLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${StagingLambdaFunction}' # Use !Ref to get function name
+      RetentionInDays: 14
+
+  WhatsAppMessagingLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${WhatsAppMessagingLambdaFunction}' # Use !Ref
+      RetentionInDays: 14
+
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${RepliesWebhookApi}' # SAM constructs name for HttpApi logs
+      RetentionInDays: 14
+
+  # --- CloudWatch Alarms (Example - Add more based on LLD/needs) ---
+  # Re-using the shared SNS Topic from template-sender-engine
+  # Example: Alarm if Staging Lambda fails frequently
+  # StagingLambdaErrorAlarm:
+  #   Type: AWS::CloudWatch::Alarm
+  #   Properties:
+  #     AlarmName: !Sub '${RepliesProjectPrefix}-StagingLambda-Errors-${EnvironmentName}'
+  #     AlarmDescription: 'Alarm if Staging Lambda has errors'
+  #     Namespace: AWS/Lambda
+  #     MetricName: Errors
+  #     Dimensions:
+  #       - Name: FunctionName
+  #         Value: !Ref StagingLambdaFunction
+  #     Statistic: Sum
+  #     Period: 300 # 5 minutes
+  #     EvaluationPeriods: 1
+  #     Threshold: 1
+  #     ComparisonOperator: GreaterThanOrEqualToThreshold
+  #     TreatMissingData: notBreaching
+  #     AlarmActions:
+  #       - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${SharedProjectPrefix}-critical-alerts-${EnvironmentName}'
+
+
+Outputs:
+  RepliesWebhookApiUrl:
+    Description: "URL for the Replies Webhook API Gateway"
+    Value: !Sub "https://${RepliesWebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}" # Include stage in URL
+
+  StagingLambdaFunctionName:
+    Description: "Staging Lambda Function Name"
+    Value: !Ref StagingLambdaFunction
+  StagingLambdaFunctionArn:
+    Description: "Staging Lambda Function ARN"
+    Value: !GetAtt StagingLambdaFunction.Arn
+  StagingLambdaRoleArn:
+      Description: "ARN of the IAM Role for the Staging Lambda"
+      Value: !GetAtt StagingLambdaRole.Arn
+
+  WhatsAppMessagingLambdaFunctionName:
+    Description: "WhatsApp Messaging Lambda Function Name"
+    Value: !Ref WhatsAppMessagingLambdaFunction
+  WhatsAppMessagingLambdaFunctionArn:
+    Description: "WhatsApp Messaging Lambda Function ARN"
+    Value: !GetAtt WhatsAppMessagingLambdaFunction.Arn
+  WhatsAppMessagingLambdaRoleArn:
+      Description: "ARN of the IAM Role for the WhatsApp Messaging Lambda"
+      Value: !GetAtt WhatsAppMessagingLambdaRole.Arn
+
+  ConversationsStageTableName:
+    Description: "Name of the Conversations Staging DynamoDB Table"
+    Value: !Ref ConversationsStageTable
+  ConversationsTriggerLockTableName:
+    Description: "Name of the Trigger Lock DynamoDB Table"
+    Value: !Ref ConversationsTriggerLockTable
+
+  WhatsAppQueueUrl:
+    Description: "URL of the Replies WhatsApp SQS Queue"
+    Value: !Ref WhatsAppQueue
+  WhatsAppQueueArn:
+    Description: "ARN of the Replies WhatsApp SQS Queue"
+    Value: !GetAtt WhatsAppQueue.Arn
+  EmailQueueUrl:
+    Description: "URL of the Replies Email SQS Queue"
+    Value: !Ref EmailQueue
+  EmailQueueArn:
+    Description: "ARN of the Replies Email SQS Queue"
+    Value: !GetAtt EmailQueue.Arn
+  SmsQueueUrl:
+    Description: "URL of the Replies SMS SQS Queue"
+    Value: !Ref SmsQueue
+  SmsQueueArn:
+    Description: "ARN of the Replies SMS SQS Queue"
+    Value: !GetAtt SmsQueue.Arn
+  HumanHandoffQueueUrl:
+    Description: "URL of the Replies Human Handoff SQS Queue"
+    Value: !Ref HumanHandoffQueue
+  HumanHandoffQueueArn:
+    Description: "ARN of the Replies Human Handoff SQS Queue"
+    Value: !GetAtt HumanHandoffQueue.Arn
+
+  SharedSNSTopicArn:
+    Description: "ARN of the Shared Critical Alerts SNS Topic"
+    Value: !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${SharedProjectPrefix}-critical-alerts-${EnvironmentName}'
+
+# </rewritten_file> 

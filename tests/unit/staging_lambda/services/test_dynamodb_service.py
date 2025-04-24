@@ -1,4 +1,5 @@
 import pytest
+import os # Import os
 from unittest.mock import patch, MagicMock, ANY
 from botocore.exceptions import ClientError
 import time
@@ -6,16 +7,21 @@ import time
 # Use the correct absolute import path based on project structure
 from src.staging_lambda.lambda_pkg.services import dynamodb_service
 
-# Define expected table names (match defaults or mock env vars if needed)
-CONVERSATIONS_TABLE_NAME = 'ai-multi-comms-conversations-dev'
-STAGE_TABLE_NAME = 'conversations-stage-test'
-LOCK_TABLE_NAME = 'conversations-trigger-lock-test'
+# Remove local constants, rely on env vars set by pytest-env / pytest.ini
+# CONVERSATIONS_TABLE_NAME = 'ai-multi-comms-conversations-dev'
+# STAGE_TABLE_NAME = 'conversations-stage-test'
+# LOCK_TABLE_NAME = 'conversations-trigger-lock-test'
 
 # --- Fixtures ---
 
 @pytest.fixture
 def mock_dynamodb_resource():
     """Mocks the boto3 DynamoDB resource and its Table objects."""
+    # Get expected table names from env vars (set by pytest-env)
+    expected_conversations_table = os.environ.get('CONVERSATIONS_TABLE_NAME', 'DEFAULT_SHOULD_FAIL_TEST')
+    expected_stage_table = os.environ.get('STAGE_TABLE_NAME', 'DEFAULT_SHOULD_FAIL_TEST')
+    expected_lock_table = os.environ.get('LOCK_TABLE_NAME', 'DEFAULT_SHOULD_FAIL_TEST')
+
     mock_resource = MagicMock()
     mock_conversations_table = MagicMock(name="ConversationsTable")
     mock_stage_table = MagicMock(name="StageTable")
@@ -23,14 +29,16 @@ def mock_dynamodb_resource():
 
     # Configure the resource mock to return specific table mocks based on name
     def table_side_effect(table_name):
-        if table_name == CONVERSATIONS_TABLE_NAME:
+        # Use the names fetched from environment variables for comparison
+        if table_name == expected_conversations_table:
             return mock_conversations_table
-        elif table_name == STAGE_TABLE_NAME:
+        elif table_name == expected_stage_table:
             return mock_stage_table
-        elif table_name == LOCK_TABLE_NAME:
+        elif table_name == expected_lock_table:
             return mock_lock_table
         else:
-            raise ValueError(f"Unexpected table name: {table_name}")
+            # This should ideally not happen if env vars are set correctly
+            raise ValueError(f"Unexpected table name passed to boto3.resource.Table: {table_name}")
 
     mock_resource.Table.side_effect = table_side_effect
 
@@ -50,7 +58,7 @@ def mock_dynamodb_resource():
             "lock": mock_lock_table
         }
         # Optional: Reload again after tests to potentially restore original state
-        # importlib.reload(dynamodb_service)
+        importlib.reload(dynamodb_service) # Reload to reset module state potentially
 
 # --- get_credential_ref_for_validation Tests ---
 
