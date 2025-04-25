@@ -8,6 +8,7 @@ import boto3
 import pytest
 import requests
 from boto3.dynamodb.conditions import Key
+from datetime import datetime, timezone
 
 # Remove top-level constants, read from os.environ within tests/fixtures
 # from .conftest import (
@@ -199,6 +200,26 @@ class TestWhatsAppReplyFlow:
         assert message_history[-2].get("role") == "user"
         assert message_history[-2].get("content") == TEST_REQUEST_BODY
         print("Additional assertions on final item passed (optional).")
+
+        # --- Teardown: Reset conversation status (inside the main try block is fine, or use a dedicated try/finally at the end) --- #
+        print(f"\nAttempting to reset status for {TEST_CONVERSATION_ID} back to initial_message_sent...")
+        try:
+            conversations_tbl.update_item(
+                Key={
+                    "primary_channel": TEST_USER_PHONE,
+                    "conversation_id": TEST_CONVERSATION_ID
+                },
+                UpdateExpression="SET conversation_status = :initial_status, updated_at = :ts",
+                ExpressionAttributeValues={
+                    ":initial_status": "initial_message_sent",
+                    ":ts": datetime.now(timezone.utc).isoformat()
+                }
+            )
+            print("Conversation status reset successfully.")
+        except ClientError as e:
+            print(f"WARN: Failed to reset conversation status during teardown: {e}")
+        except Exception as e:
+            print(f"WARN: Unexpected error during status reset teardown: {e}")
 
     # Remove the old test_trigger_message_appears_on_sqs
     # def test_trigger_message_appears_on_sqs(...): 
