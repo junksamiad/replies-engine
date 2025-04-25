@@ -1,0 +1,71 @@
+{
+    "company_id": "ci-aaa-000",
+    "project_id": "pi-aaa-000",
+    "company_name": "Adaptix Innovation",
+    "project_name": "Tests",
+    "allowed_channels": ["whatsapp", "sms", "email"],
+    "auto_queue_initial_message": false,
+    "auto_queue_initial_message_from_number": [],
+    "auto_queue_initial_message_from_email": [],
+    "auto_queue_reply_message": false,
+    "auto_queue_reply_message_from_number": [],
+    "auto_queue_reply_message_from_email": [],
+    "rate_limits": {
+      "requests_per_minute": 60,
+      "requests_per_day": 2000,
+      "concurrent_conversations": 30,
+      "max_message_length": 4096
+    },
+    "project_status": "active",
+    "company_rep": {
+      "company_rep_1": "Adaptix Innovation",
+      "company_rep_2": null,
+      "company_rep_3": null,
+      "company_rep_4": null,
+      "company_rep_5": null
+    },
+    "ai_config": {
+      "openai_config": {
+        "whatsapp": {
+          "api_key_reference": "ai-multi-comms/openai-api-key/whatsapp-dev",
+          "assistant_id_template_sender": "asst_FAYJva8KwGksePejLpMhEE2A",
+          "assistant_id_replies": "asst_yI2xMm8ixFbXd6OE99Y377kZ",
+          "assistant_id_3": "",
+          "assistant_id_4": "",
+          "assistant_id_5": ""
+        },
+        "sms": {
+          "api_key_reference": "ai-multi-comms/openai-api-key/sms-dev",
+          "assistant_id_template_sender": "",
+          "assistant_id_replies": "",
+          "assistant_id_3": "",
+          "assistant_id_4": "",
+          "assistant_id_5": ""
+        },
+        "email": {
+          "api_key_reference": "ai-multi-comms/openai-api-key/email-dev",
+          "assistant_id_template_sender": "",
+          "assistant_id_replies": "",
+          "assistant_id_3": "",
+          "assistant_id_4": "",
+          "assistant_id_5": ""
+        }
+      }
+    },
+    "channel_config": {
+      "whatsapp": {
+        "company_whatsapp_number": "+447450659796",
+        "whatsapp_credentials_id": "ai-multi-comms/whatsapp-credentials/adaptix-innovation/tests/twilio-dev"
+      },
+      "email": {
+        "company_email": "lee.hayton@adaptixinnovation.co.uk",
+        "email_credentials_id": "ai-multi-comms/email-credentials/adaptix-innovation/tests/sendgrid-dev"
+      },
+      "sms": {
+          "company_sms_number": "+447450659796",
+          "sms_credentials_id": "ai-multi-comms/sms-credentials/adaptix-innovation/tests/twilio-dev"
+        }
+    },
+    "created_at": "2023-10-27T10:00:00Z",
+    "updated_at": "2023-10-27T10:00:00Z"
+  } 

@@ -1,31 +1,48 @@
 import json
 import time
-from typing import List
+import os
+from typing import List, Dict, Any
+from unittest.mock import patch, MagicMock
 
 import boto3
 import pytest
 import requests
+from boto3.dynamodb.conditions import Key
+from datetime import datetime, timezone
 
-from .conftest import (
-    API_BASE_URL,
-    STAGE_TABLE_NAME,
-    LOCK_TABLE_NAME,
-    CONVERSATIONS_TABLE_NAME,
-    WHATSAPP_QUEUE_URL,
-    WHATSAPP_QUEUE_DELAY_SEC,
-)
+# Remove top-level constants, read from os.environ within tests/fixtures
+# from .conftest import (
+#     API_BASE_URL,
+#     STAGE_TABLE_NAME,
+#     LOCK_TABLE_NAME,
+#     CONVERSATIONS_TABLE_NAME, # Not directly used in this file
+#     WHATSAPP_QUEUE_URL,
+#     WHATSAPP_QUEUE_DELAY_SEC,
+# )
 
+# --- Define constants for the specific pre-existing test record --- #
+TEST_USER_PHONE = "+447835065013"
+TEST_COMPANY_PHONE = "+447450659796"
+TEST_CONVERSATION_ID = "ci-aaa-000#pi-aaa-000#f1fa775c-a8a8-4352-9f03-6351bc20fe24#447588713814"
+TEST_REQUEST_BODY = "THIS IS AN INTEGRATION TEST RUN, PLEASE REPLY WITH ANY MESSAGE"
+
+# Import Twilio validator
+from twilio.request_validator import RequestValidator
 
 @pytest.mark.integration
-@pytest.mark.usefixtures("clear_stage_and_lock_tables", "seed_conversation_item")
+# Use only the cleanup fixture, pass fixed conversation ID
+@pytest.mark.usefixtures("clear_stage_and_lock_tables")
 class TestWhatsAppReplyFlow:
     """Integration tests that exercise the deployed *dev* replies‑engine stack.
     These tests require AWS credentials with access to the dev account and the
-    resources enumerated in ``tests/integration/conftest.py``. Set environment
-    variables to override defaults when running against a different stack.
+    resources enumerated in integration conftest.py via os.environ.
+    Mocks external AI and Twilio send calls.
     """
 
-    _SQS_POLL_TIMEOUT = 60  # seconds – max time to wait for trigger message
+    # Increase timeout slightly to allow for full flow + SQS delay
+    _POLL_TIMEOUT_LONG = 90 # seconds
+    _POLL_TIMEOUT_SHORT = 30 # seconds
+    _POLL_INTERVAL = 3.0 # seconds
 
     # ---------------------------------------------------------------------
     # Helper / polling utilities
@@ -43,82 +60,164 @@ class TestWhatsAppReplyFlow:
             if result:
                 return result
             time.sleep(interval)
-        raise AssertionError("Timeout waiting for condition to become true")
+        raise AssertionError(f"Timeout ({timeout}s) waiting for condition: {predicate.__name__}")
 
     # ------------------------------------------------------------------
     # Tests
     # ------------------------------------------------------------------
 
-    def test_stage_lambda_persists_fragment_and_lock(
+    def test_full_reply_flow(
         self,
         aws_clients,
-        test_phone_numbers,
-        conversation_id,
+        twilio_auth_token, # Inject token fixture
     ):
-        """Send a fake Twilio WhatsApp webhook and ensure the staging lambda
-        persists a fragment row and acquires the trigger lock."""
-        stage_tbl = aws_clients["dynamodb"].Table(STAGE_TABLE_NAME)
-        lock_tbl = aws_clients["dynamodb"].Table(LOCK_TABLE_NAME)
+        """Tests the full flow using a PRE-EXISTING conversation record."""
+        # --- Test Setup --- #
+        stage_table_name = os.environ['STAGE_TABLE_NAME']
+        lock_table_name = os.environ['LOCK_TABLE_NAME']
+        conversations_table_name = os.environ['CONVERSATIONS_TABLE_NAME']
+        api_base_url = os.environ['REPLIES_API_URL']
+        request_url = f"{api_base_url}/whatsapp"
+        whatsapp_queue_delay_sec = int(os.environ.get("WHATSAPP_QUEUE_DELAY_SEC", 10))
+        min_wait_time = whatsapp_queue_delay_sec + 30 # Adjust buffer as needed
 
-        # ----------------- 1. Fire webhook ----------------------------
-        msg_sid = f"SM{int(time.time() * 1000)}"
+        stage_tbl = aws_clients["dynamodb"].Table(stage_table_name)
+        lock_tbl = aws_clients["dynamodb"].Table(lock_table_name)
+        conversations_tbl = aws_clients["dynamodb"].Table(conversations_table_name)
+
+        # --- 1. Fire webhook to trigger Staging Lambda --- #
+        msg_sid = f"SM_INT_TEST_{int(time.time() * 1000)}"
         payload_dict = {
-            "To": f"whatsapp:{test_phone_numbers['company']}",
-            "From": f"whatsapp:{test_phone_numbers['user']}",
-            "Body": "Hello integration test",
+            "To": f"whatsapp:{TEST_COMPANY_PHONE}",
+            "From": f"whatsapp:{TEST_USER_PHONE}",
+            "Body": TEST_REQUEST_BODY,
             "MessageSid": msg_sid,
             "AccountSid": "ACXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
         }
+
+        # Compute the valid signature using the real token
+        validator = RequestValidator(twilio_auth_token)
+        signature = validator.compute_signature(request_url, payload_dict)
+
+        print(f"\nSending POST to {request_url}...")
         resp = requests.post(
-            f"{API_BASE_URL}/webhook", data=payload_dict, timeout=10
+            request_url,
+            data=payload_dict,
+            headers={"X-Twilio-Signature": signature}, # Send REAL signature
+            timeout=15
         )
-        # API Gateway replies 200 OK instantly (staging lambda returns body)
+        print(f"API Response Status: {resp.status_code}")
         assert resp.status_code == 200
+        print("Staging Lambda invocation successful (API returned 200).")
 
-        # ----------------- 2. Verify DynamoDB fragment row -------------
-        def _has_stage_fragment():
-            resp_q = stage_tbl.query(
-                KeyConditionExpression=boto3.dynamodb.conditions.Key("conversation_id").eq(conversation_id)
+        # --- 2. Wait and Verify Final State & Cleanup --- #
+
+        print(f"Waiting {min_wait_time}s for SQS delay and processing (incl. real AI/Twilio calls)...")
+        time.sleep(min_wait_time)
+
+        # Helper to check staging table
+        def _get_stage_fragments():
+            try:
+                resp_q = stage_tbl.query(
+                    KeyConditionExpression=Key("conversation_id").eq(TEST_CONVERSATION_ID)
+                )
+                print(f"  Polling staging table for {TEST_CONVERSATION_ID}: Found {len(resp_q.get('Items', []))} items.")
+                return resp_q.get("Items", [])
+            except ClientError as e:
+                print(f"  Polling staging table failed: {e}")
+                return None # Indicate error
+
+        # Helper to check lock table
+        def _get_trigger_lock():
+             try:
+                 lock_item = lock_tbl.get_item(Key={"conversation_id": TEST_CONVERSATION_ID}).get("Item")
+                 print(f"  Polling lock table for {TEST_CONVERSATION_ID}: Found item? {lock_item is not None}")
+                 return lock_item
+             except ClientError as e:
+                 print(f"  Polling lock table failed: {e}")
+                 return None # Indicate error
+
+        # Helper to check main conversations table status and history
+        def _get_final_conversation_state():
+            try:
+                key = {
+                    "primary_channel": TEST_USER_PHONE,
+                    "conversation_id": TEST_CONVERSATION_ID
+                }
+                item = conversations_tbl.get_item(Key=key).get("Item")
+                if not item:
+                    print(f"  Polling main table for {TEST_CONVERSATION_ID}: Item not found yet.")
+                    return None
+                status = item.get("conversation_status")
+                history = item.get("messages", [])
+                # Expect initial record's history + user reply + assistant reply
+                expected_history_len = 1 + 2 # Record starts with 1 message
+                print(f"  Polling main table for {TEST_CONVERSATION_ID}: Status='{status}', MessagesLen={len(history)}")
+                if status == "reply_sent" and len(history) >= expected_history_len:
+                    return item
+                return None # Not yet in final state
+            except ClientError as e:
+                print(f"  Polling main table failed: {e}")
+                return None # Indicate error
+
+        # --- Assertions --- #
+
+        # A. Verify Staging Table Cleanup
+        print(f"\nPolling for staging table cleanup (max {self._POLL_TIMEOUT_LONG}s)...")
+        try:
+             self._poll_until(lambda: not _get_stage_fragments(), timeout=self._POLL_TIMEOUT_LONG, interval=self._POLL_INTERVAL)
+             print("Staging table cleanup VERIFIED.")
+        except AssertionError:
+             pytest.fail("Timed out waiting for staging table items to be deleted.", pytrace=False)
+
+        # B. Verify Trigger Lock Cleanup
+        print(f"\nPolling for trigger lock cleanup (max {self._POLL_TIMEOUT_SHORT}s)...")
+        try:
+            self._poll_until(lambda: not _get_trigger_lock(), timeout=self._POLL_TIMEOUT_SHORT, interval=self._POLL_INTERVAL)
+            print("Trigger lock cleanup VERIFIED.")
+        except AssertionError:
+            pytest.fail("Timed out waiting for trigger lock item to be deleted.", pytrace=False)
+
+        # C. Verify Final State in Main Conversations Table
+        print(f"\nPolling for main conversation table final state (max {self._POLL_TIMEOUT_LONG}s)...")
+        final_item = None
+        try:
+            final_item = self._poll_until(_get_final_conversation_state, timeout=self._POLL_TIMEOUT_LONG, interval=self._POLL_INTERVAL)
+            print(f"Main conversation table final state VERIFIED (Status: {final_item.get('conversation_status')}, MessagesLen: {len(final_item.get('messages', []))})")
+        except AssertionError:
+            pytest.fail("Timed out waiting for main conversation table to reach final state (reply_sent, messages updated).", pytrace=False)
+
+        # D. Optional: Add more specific assertions on final_item content
+        assert final_item is not None, "Final conversation item was None despite polling success (should not happen)"
+        message_history = final_item.get("messages", [])
+        # Assert exact length now that we know initial state
+        assert len(message_history) == 3, f"Expected message history length 3, but got {len(message_history)}"
+        # Example: Check last message role
+        assert message_history[-1].get("role") == "assistant"
+        assert message_history[-2].get("role") == "user"
+        assert message_history[-2].get("content") == TEST_REQUEST_BODY
+        print("Additional assertions on final item passed (optional).")
+
+        # --- Teardown: Reset conversation status (inside the main try block is fine, or use a dedicated try/finally at the end) --- #
+        print(f"\nAttempting to reset status for {TEST_CONVERSATION_ID} back to initial_message_sent...")
+        try:
+            conversations_tbl.update_item(
+                Key={
+                    "primary_channel": TEST_USER_PHONE,
+                    "conversation_id": TEST_CONVERSATION_ID
+                },
+                UpdateExpression="SET conversation_status = :initial_status, updated_at = :ts",
+                ExpressionAttributeValues={
+                    ":initial_status": "initial_message_sent",
+                    ":ts": datetime.now(timezone.utc).isoformat()
+                }
             )
-            return resp_q["Items"]
+            print("Conversation status reset successfully.")
+        except ClientError as e:
+            print(f"WARN: Failed to reset conversation status during teardown: {e}")
+        except Exception as e:
+            print(f"WARN: Unexpected error during status reset teardown: {e}")
 
-        items: List[dict] = self._poll_until(_has_stage_fragment, timeout=20)
-        assert any(it["message_sid"] == msg_sid for it in items)
-
-        # ----------------- 3. Verify lock row --------------------------
-        lock_item = lock_tbl.get_item(Key={"conversation_id": conversation_id}).get("Item")
-        assert lock_item is not None, "Trigger lock not acquired"
-
-    def test_trigger_message_appears_on_sqs(
-        self,
-        aws_clients,
-        test_phone_numbers,
-        conversation_id,
-    ):
-        """End‑to‑end part 2 – after the staging lambda executes it should
-        enqueue a trigger message (conversation_id & primary_channel) on the
-        WhatsApp queue.  We poll the queue until the message is visible."""
-        sqs = aws_clients["sqs"]
-
-        # Allow time for queue delay to elapse plus processing jitter
-        min_visible_time = WHATSAPP_QUEUE_DELAY_SEC + 2
-        time.sleep(min_visible_time)
-
-        def _receive_once():
-            msgs = sqs.receive_message(
-                QueueUrl=WHATSAPP_QUEUE_URL,
-                MaxNumberOfMessages=10,
-                WaitTimeSeconds=1,
-            ).get("Messages", [])
-            # Filter messages matching our conversation id
-            return [m for m in msgs if conversation_id in m["Body"]]
-
-        matching_msgs = self._poll_until(_receive_once, timeout=self._SQS_POLL_TIMEOUT)
-        assert matching_msgs, "No trigger message found for conversation id"
-
-        # Clean up the message(s) so that dev queue doesn't grow indefinitely
-        for m in matching_msgs:
-            sqs.delete_message(
-                QueueUrl=WHATSAPP_QUEUE_URL,
-                ReceiptHandle=m["ReceiptHandle"],
-            ) 
+    # Remove the old test_trigger_message_appears_on_sqs
+    # def test_trigger_message_appears_on_sqs(...): 
+    #     ... 

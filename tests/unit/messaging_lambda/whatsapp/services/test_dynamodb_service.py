@@ -209,7 +209,7 @@ def test_update_conversation_success_minimal(mock_dt, mock_dynamodb_resource):
     assert call_args['ExpressionAttributeValues'][':lock_status'] == dynamodb_service.PROCESSING_STATUS
     assert call_args['ExpressionAttributeNames']['#status'] == "conversation_status"
     assert call_args['ExpressionAttributeNames']['#updated'] == "updated_at"
-    assert call_args['ExpressionAttributeNames']['#msgs'] == "messages"
+    assert call_args['ExpressionAttributeNames']['#msgs'] == "message_history"
 
 @patch('src.messaging_lambda.whatsapp.lambda_pkg.services.dynamodb_service.datetime')
 def test_update_conversation_success_all_fields(mock_dt, mock_dynamodb_resource):

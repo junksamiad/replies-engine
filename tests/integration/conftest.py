@@ -3,26 +3,46 @@ import random
 import string
 import time
 import uuid
+import json
 from typing import Dict, Any
 
 import boto3
 import pytest
 import requests
+from botocore.exceptions import ClientError
 
 # ---------------------------------------------------------------------------
 # Helpers / Constants
 # ---------------------------------------------------------------------------
 
 REGION = os.environ.get("AWS_REGION", "eu-north-1")
-ACCOUNT_ID = os.environ.get("AWS_ACCOUNT_ID")  # Optional but helpful for table ARNs if needed
+ACCOUNT_ID = os.environ.get("AWS_ACCOUNT_ID")  # Optional but helpful
 
-# Replies‑engine (dev) default resource names – override with env vars if desired
-API_BASE_URL = os.environ.get("REPLIES_API_URL", "https://dc1fn3ses0.execute-api.eu-north-1.amazonaws.com")
-STAGE_TABLE_NAME = os.environ.get("STAGE_TABLE_NAME", "ai-multi-comms-replies-conversations-stage-dev")
-LOCK_TABLE_NAME = os.environ.get("LOCK_TABLE_NAME", "ai-multi-comms-replies-conversations-trigger-lock-dev")
-CONVERSATIONS_TABLE_NAME = os.environ.get("CONVERSATIONS_TABLE_NAME", "ai-multi-comms-conversations-dev")
-WHATSAPP_QUEUE_URL = os.environ.get("WHATSAPP_QUEUE_URL", "https://sqs.eu-north-1.amazonaws.com/337909745089/ai-multi-comms-replies-whatsapp-queue-dev")
-WHATSAPP_QUEUE_DELAY_SEC = int(os.environ.get("WHATSAPP_QUEUE_DELAY_SEC", "10"))
+# Remove top-level constants derived from os.environ
+# They will be read directly from os.environ within fixtures/tests
+# after pytest_configure updates the environment.
+# API_BASE_URL = os.environ.get("REPLIES_API_URL", "...")
+# STAGE_TABLE_NAME = os.environ.get("STAGE_TABLE_NAME", "...")
+# LOCK_TABLE_NAME = os.environ.get("LOCK_TABLE_NAME", "...")
+# CONVERSATIONS_TABLE_NAME = os.environ.get("CONVERSATIONS_TABLE_NAME", "...")
+# WHATSAPP_QUEUE_URL = os.environ.get("WHATSAPP_QUEUE_URL", "...")
+# WHATSAPP_QUEUE_DELAY_SEC = int(os.environ.get("WHATSAPP_QUEUE_DELAY_SEC", "10"))
+
+# --- Hook to override env vars for integration tests ---
+def pytest_configure():
+    """This hook runs after pytest-env sets dummies but before tests are collected/run."""
+    # Define the *real* values for the dev environment
+    _REAL_DEV_ENV = {
+        "REPLIES_API_URL": "https://716zgxg7ma.execute-api.eu-north-1.amazonaws.com/dev",
+        "STAGE_TABLE_NAME": "ai-multi-comms-replies-conversations-stage-dev",
+        "LOCK_TABLE_NAME": "ai-multi-comms-replies-conversations-trigger-lock-dev",
+        "CONVERSATIONS_TABLE_NAME": "ai-multi-comms-conversations-dev",
+        "WHATSAPP_QUEUE_URL": "https://sqs.eu-north-1.amazonaws.com/337909745089/ai-multi-comms-replies-whatsapp-queue-dev",
+        "AWS_REGION": "eu-north-1", # Also set region if code relies on it
+        # Add any other variables needed by integration tests that might conflict with dummies
+    }
+    print("\nConfiguring integration test environment variables...")
+    os.environ.update(_REAL_DEV_ENV)
 
 # ---------------------------------------------------------------------------
 # Pytest Fixtures
@@ -36,8 +56,32 @@ def aws_clients():
     return {
         "dynamodb": session.resource("dynamodb"),
         "sqs": session.client("sqs"),
+        "secretsmanager": session.client("secretsmanager")
     }
 
+@pytest.fixture(scope="session")
+def twilio_auth_token(aws_clients):
+    """Fetches the Twilio auth token from Secrets Manager once per session."""
+    # Use the actual secret name for the dev environment
+    secret_name = "ai-multi-comms/whatsapp-credentials/cucumber-recruitment/clarify-cv/twilio-dev"
+    print(f"\nFetching Twilio auth token from secret: {secret_name}")
+    try:
+        sm_client = aws_clients["secretsmanager"]
+        response = sm_client.get_secret_value(SecretId=secret_name)
+        secret_string = response['SecretString']
+        # Assuming the secret stores a JSON string with a key like 'twilio_auth_token'
+        # Adjust the key if your secret structure is different
+        auth_token = json.loads(secret_string).get('twilio_auth_token')
+        if not auth_token:
+            pytest.fail(f"Key 'twilio_auth_token' not found in secret {secret_name}", pytrace=False)
+        print("Successfully fetched Twilio auth token.")
+        return auth_token
+    except ClientError as e:
+        pytest.fail(f"Failed to fetch Twilio auth token secret {secret_name}: {e}", pytrace=False)
+    except (json.JSONDecodeError, KeyError) as e:
+        pytest.fail(f"Failed to parse Twilio auth token from secret {secret_name}: {e}", pytrace=False)
+    except Exception as e:
+        pytest.fail(f"Unexpected error fetching Twilio auth token secret {secret_name}: {e}", pytrace=False)
 
 @pytest.fixture
 def test_phone_numbers() -> Dict[str, str]:
@@ -51,7 +95,6 @@ def test_phone_numbers() -> Dict[str, str]:
         "company": company_number,
     }
 
-
 @pytest.fixture
 def conversation_id(test_phone_numbers) -> str:
     # Keep derivation logic in sync with staging lambda (sorted numbers)
@@ -59,49 +102,14 @@ def conversation_id(test_phone_numbers) -> str:
     # Keep plus signs because staging lambda includes them in conversation_id derivation
     return f"conv_{'_'.join(nums_sorted)}"
 
-
-@pytest.fixture
-def seed_conversation_item(aws_clients, test_phone_numbers, conversation_id):
-    """Insert a minimal conversation item into the shared conversations table so that the
-    messaging lambda can hydrate context later in the flow."""
-    table = aws_clients["dynamodb"].Table(CONVERSATIONS_TABLE_NAME)
-
-    # Token values below can reference existing dev secrets / assistant ids already deployed
-    item = {
-        "primary_channel": test_phone_numbers["user"],
-        "conversation_id": conversation_id,
-        "thread_id": str(uuid.uuid4()),
-        "conversation_status": "active",
-        "ai_config": {
-            "assistant_id_replies": "asst_replies_test",  # dummy but required
-            "api_key_reference": "ai-multi-comms/openai-api-key/whatsapp-dev-test"
-        },
-        "channel_config": {
-            "whatsapp_credentials_id": "ai-multi-comms/whatsapp-credentials/company/dev-test",
-            "company_whatsapp_number": test_phone_numbers["company"],
-        },
-        # Other attributes stripped for brevity
-    }
-
-    table.put_item(Item=item)
-
-    yield item
-
-    # Clean up – best‑effort delete
-    try:
-        table.delete_item(Key={
-            "primary_channel": item["primary_channel"],
-            "conversation_id": item["conversation_id"],
-        })
-    except Exception:
-        pass
-
-
 @pytest.fixture
 def clear_stage_and_lock_tables(aws_clients, conversation_id):
     """Ensure staging & lock tables are clear of this conversation before test."""
-    stage_tbl = aws_clients["dynamodb"].Table(STAGE_TABLE_NAME)
-    lock_tbl = aws_clients["dynamodb"].Table(LOCK_TABLE_NAME)
+    # Read table names directly from os.environ inside the fixture
+    stage_tbl_name = os.environ['STAGE_TABLE_NAME']
+    lock_tbl_name = os.environ['LOCK_TABLE_NAME']
+    stage_tbl = aws_clients["dynamodb"].Table(stage_tbl_name)
+    lock_tbl = aws_clients["dynamodb"].Table(lock_tbl_name)
     # Delete potential residual items
     try:
         # Scan is acceptable for tiny dev tables; otherwise use query on PK
