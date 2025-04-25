@@ -59,7 +59,6 @@ def aws_clients():
         "secretsmanager": session.client("secretsmanager")
     }
 
-# --- Fixture to fetch the real auth token ---
 @pytest.fixture(scope="session")
 def twilio_auth_token(aws_clients):
     """Fetches the Twilio auth token from Secrets Manager once per session."""
@@ -96,77 +95,12 @@ def test_phone_numbers() -> Dict[str, str]:
         "company": company_number,
     }
 
-
 @pytest.fixture
 def conversation_id(test_phone_numbers) -> str:
     # Keep derivation logic in sync with staging lambda (sorted numbers)
     nums_sorted = sorted([test_phone_numbers["user"], test_phone_numbers["company"]])
     # Keep plus signs because staging lambda includes them in conversation_id derivation
     return f"conv_{'_'.join(nums_sorted)}"
-
-
-@pytest.fixture
-def seed_conversation_item(aws_clients, test_phone_numbers, conversation_id):
-    """Insert a minimal conversation item into the shared conversations table so that the
-    messaging lambda can hydrate context later in the flow."""
-    conversations_table_name = os.environ['CONVERSATIONS_TABLE_NAME']
-    table = aws_clients["dynamodb"].Table(conversations_table_name)
-
-    # Extract numbers without prefix for GSI
-    user_num_no_prefix = test_phone_numbers["user"].split(':')[-1]
-    company_num_no_prefix = test_phone_numbers["company"].split(':')[-1]
-
-    # Define a credential ID that matches the IAM policy pattern AND EXISTS in Secrets Manager
-    matching_credential_id = "ai-multi-comms/whatsapp-credentials/cucumber-recruitment/clarify-cv/twilio-dev" # Use actual existing secret name for dev
-
-    item = {
-        # Main Keys
-        "primary_channel": test_phone_numbers["user"],
-        "conversation_id": conversation_id,
-        # GSI Keys (Match GSI definition)
-        "gsi_company_whatsapp_number": company_num_no_prefix, # GSI PK
-        "gsi_recipient_tel": user_num_no_prefix,             # GSI SK
-        # Other required fields
-        "project_status": "active",
-        "allowed_channels": ["whatsapp"],
-        "thread_id": str(uuid.uuid4()),
-        "conversation_status": "active",
-        "ai_config": {
-            "assistant_id_replies": "asst_replies_test",
-            "api_key_reference": "ai-multi-comms/openai-api-key/whatsapp-dev-test"
-        },
-        "channel_config": {
-            "whatsapp_credentials_id": matching_credential_id, # Use the actual secret name
-            "company_whatsapp_number": company_num_no_prefix,
-        },
-    }
-
-    try:
-        print(f"\nSEEDING conversation item with cred ID: {matching_credential_id} into {conversations_table_name}")
-        table.put_item(Item=item)
-        print("SEEDING successful")
-    except ClientError as e:
-        print(f"\nERROR SEEDING conversation item: {e}") # Add print
-        pytest.fail(f"Failed to seed conversation item: {e}", pytrace=False)
-    except Exception as e:
-        print(f"\nUNEXPECTED ERROR SEEDING conversation item: {e}") # Add print
-        pytest.fail(f"Unexpected error seeding conversation item: {e}", pytrace=False)
-
-    yield item
-
-    # Clean up – best‑effort delete
-    try:
-        print(f"\nCLEANING UP seeded item for {conversation_id}")
-        table = aws_clients["dynamodb"].Table(os.environ['CONVERSATIONS_TABLE_NAME'])
-        table.delete_item(Key={
-            "primary_channel": item["primary_channel"],
-            "conversation_id": item["conversation_id"],
-        })
-        print("CLEANUP successful")
-    except Exception as e:
-        print(f"\nERROR CLEANING UP seeded item: {e}")
-        pass # Allow cleanup to fail silently
-
 
 @pytest.fixture
 def clear_stage_and_lock_tables(aws_clients, conversation_id):
