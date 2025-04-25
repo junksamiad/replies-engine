@@ -22,8 +22,8 @@ from datetime import datetime, timezone
 
 # --- Define constants for the specific pre-existing test record --- #
 TEST_USER_PHONE = "+447835065013"
-TEST_COMPANY_PHONE = "+447588713814"
-TEST_CONVERSATION_ID = "ci-aaa-001#pi-aaa-001#f1fa775c-a8a8-4352-9f03-6351bc20fe24#447588713814"
+TEST_COMPANY_PHONE = "+447450659796"
+TEST_CONVERSATION_ID = "ci-aaa-000#pi-aaa-000#f1fa775c-a8a8-4352-9f03-6351bc20fe24#447588713814"
 TEST_REQUEST_BODY = "THIS IS AN INTEGRATION TEST RUN, PLEASE REPLY WITH ANY MESSAGE"
 
 # Import Twilio validator
@@ -150,11 +150,8 @@ class TestWhatsAppReplyFlow:
                     return None
                 status = item.get("conversation_status")
                 history = item.get("messages", [])
-                # Check if status is updated and history has expected number of messages
-                # Original record + user reply + assistant reply = expected length?
-                # Adjust initial_history_len based on the pre-existing record
-                initial_history_len = len(item.get('initial_message_history_for_test', [])) # Need a way to know initial state
-                expected_history_len = initial_history_len + 2
+                # Expect initial record's history + user reply + assistant reply
+                expected_history_len = 1 + 2 # Record starts with 1 message
                 print(f"  Polling main table for {TEST_CONVERSATION_ID}: Status='{status}', MessagesLen={len(history)}")
                 if status == "reply_sent" and len(history) >= expected_history_len:
                     return item
@@ -193,8 +190,8 @@ class TestWhatsAppReplyFlow:
         # D. Optional: Add more specific assertions on final_item content
         assert final_item is not None, "Final conversation item was None despite polling success (should not happen)"
         message_history = final_item.get("messages", [])
-        # Adjust check based on known history length of the pre-existing record
-        # assert len(message_history) >= initial_history_len + 2
+        # Assert exact length now that we know initial state
+        assert len(message_history) == 3, f"Expected message history length 3, but got {len(message_history)}"
         # Example: Check last message role
         assert message_history[-1].get("role") == "assistant"
         assert message_history[-2].get("role") == "user"
