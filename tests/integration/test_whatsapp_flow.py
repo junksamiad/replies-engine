@@ -1,19 +1,23 @@
 import json
 import time
+import os
 from typing import List
+from unittest.mock import patch
 
 import boto3
 import pytest
 import requests
+from twilio.request_validator import RequestValidator
 
-from .conftest import (
-    API_BASE_URL,
-    STAGE_TABLE_NAME,
-    LOCK_TABLE_NAME,
-    CONVERSATIONS_TABLE_NAME,
-    WHATSAPP_QUEUE_URL,
-    WHATSAPP_QUEUE_DELAY_SEC,
-)
+# Remove top-level constants, read from os.environ within tests/fixtures
+# from .conftest import (
+#     API_BASE_URL,
+#     STAGE_TABLE_NAME,
+#     LOCK_TABLE_NAME,
+#     CONVERSATIONS_TABLE_NAME, # Not directly used in this file
+#     WHATSAPP_QUEUE_URL,
+#     WHATSAPP_QUEUE_DELAY_SEC,
+# )
 
 
 @pytest.mark.integration
@@ -54,11 +58,18 @@ class TestWhatsAppReplyFlow:
         aws_clients,
         test_phone_numbers,
         conversation_id,
+        twilio_auth_token,
     ):
-        """Send a fake Twilio WhatsApp webhook and ensure the staging lambda
+        """Send a fake Twilio webhook with a VALID signature and ensure the staging lambda
         persists a fragment row and acquires the trigger lock."""
-        stage_tbl = aws_clients["dynamodb"].Table(STAGE_TABLE_NAME)
-        lock_tbl = aws_clients["dynamodb"].Table(LOCK_TABLE_NAME)
+        # Read resource names from os.environ
+        stage_table_name = os.environ['STAGE_TABLE_NAME']
+        lock_table_name = os.environ['LOCK_TABLE_NAME']
+        api_base_url = os.environ['REPLIES_API_URL']
+        request_url = f"{api_base_url}/whatsapp"
+
+        stage_tbl = aws_clients["dynamodb"].Table(stage_table_name)
+        lock_tbl = aws_clients["dynamodb"].Table(lock_table_name)
 
         # ----------------- 1. Fire webhook ----------------------------
         msg_sid = f"SM{int(time.time() * 1000)}"
@@ -69,9 +80,20 @@ class TestWhatsAppReplyFlow:
             "MessageSid": msg_sid,
             "AccountSid": "ACXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
         }
+
+        # Compute the valid signature
+        validator = RequestValidator(twilio_auth_token)
+        signature = validator.compute_signature(request_url, payload_dict)
+        print(f"\nComputed Signature: {signature}")
+
+        # Send request with REAL signature
         resp = requests.post(
-            f"{API_BASE_URL}/webhook", data=payload_dict, timeout=10
+            request_url,
+            data=payload_dict,
+            headers={"X-Twilio-Signature": signature},
+            timeout=10
         )
+
         # API Gateway replies 200 OK instantly (staging lambda returns body)
         assert resp.status_code == 200
 
@@ -98,15 +120,20 @@ class TestWhatsAppReplyFlow:
         """End‑to‑end part 2 – after the staging lambda executes it should
         enqueue a trigger message (conversation_id & primary_channel) on the
         WhatsApp queue.  We poll the queue until the message is visible."""
+        # Read resource names from os.environ
+        whatsapp_queue_url = os.environ['WHATSAPP_QUEUE_URL']
+        # Use get for delay as it might not be overridden by configure hook
+        whatsapp_queue_delay_sec = int(os.environ.get("WHATSAPP_QUEUE_DELAY_SEC", 10))
+
         sqs = aws_clients["sqs"]
 
         # Allow time for queue delay to elapse plus processing jitter
-        min_visible_time = WHATSAPP_QUEUE_DELAY_SEC + 2
+        min_visible_time = whatsapp_queue_delay_sec + 2
         time.sleep(min_visible_time)
 
         def _receive_once():
             msgs = sqs.receive_message(
-                QueueUrl=WHATSAPP_QUEUE_URL,
+                QueueUrl=whatsapp_queue_url,
                 MaxNumberOfMessages=10,
                 WaitTimeSeconds=1,
             ).get("Messages", [])
@@ -119,6 +146,6 @@ class TestWhatsAppReplyFlow:
         # Clean up the message(s) so that dev queue doesn't grow indefinitely
         for m in matching_msgs:
             sqs.delete_message(
-                QueueUrl=WHATSAPP_QUEUE_URL,
+                QueueUrl=whatsapp_queue_url,
                 ReceiptHandle=m["ReceiptHandle"],
             ) 
