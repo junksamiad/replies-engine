@@ -236,7 +236,7 @@ def update_conversation_after_reply(
 
     # Append both messages
     update_expression_parts.append("#msgs = list_append(if_not_exists(#msgs, :empty_list), :new_msgs)")
-    expression_attribute_names["#msgs"] = "message_history"
+    expression_attribute_names["#msgs"] = "messages"
     expression_attribute_values[":new_msgs"] = [user_message_map, assistant_message_map]
     expression_attribute_values[":empty_list"] = []
 
