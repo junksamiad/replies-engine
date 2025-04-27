@@ -74,5 +74,6 @@ jobs:
             --stack-name replies-engine-prod \
             --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
             --parameter-overrides EnvironmentName=prod LogLevel=INFO \
+            --resolve-s3 \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset 
