@@ -37,7 +37,18 @@ jobs:
           flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
 
       - name: Run unit tests
-        run: pytest tests/unit/
+        run: |
+          # Install explicit test dependencies
+          pip install boto3 botocore twilio pytest pytest-env
+          
+          # Debug: List installed packages
+          pip list | grep -E 'boto|twilio'
+          
+          # Set Python path to include src
+          export PYTHONPATH=$PYTHONPATH:$(pwd)
+          
+          # Run the tests
+          pytest tests/unit/
 
       - name: Build SAM application (check only)
         run: sam build --use-container
