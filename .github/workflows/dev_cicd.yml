@@ -40,13 +40,16 @@ jobs:
       - name: Run unit tests
         run: |
           # Install explicit test dependencies
-          pip install boto3 botocore twilio pytest pytest-env
+          pip install boto3 botocore twilio pytest pytest-env openai
           
           # Debug: List installed packages
-          pip list | grep -E 'boto|twilio'
+          pip list | grep -E 'boto|twilio|openai'
           
           # Set Python path to include src
           export PYTHONPATH=$PYTHONPATH:$(pwd)
+          
+          # Set AWS region for tests (default to eu-north-1 if not set)
+          export AWS_DEFAULT_REGION=eu-north-1
           
           # Run the tests
           pytest tests/unit/
