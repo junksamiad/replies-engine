@@ -1,0 +1,99 @@
+name: Dev CI/CD Pipeline
+
+on:
+  push:
+    branches: [ develop ]
+  pull_request:
+    branches: [ develop ]
+
+permissions:
+  id-token: write  # For OIDC
+  contents: read
+
+jobs:
+  pr_checks:
+    name: "PR Checks (Lint, Unit Tests, Build)"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Install dev requirements then flake8 separately so it is always available
+          pip install -r requirements-dev.txt flake8
+
+      - name: Lint with flake8
+        run: |
+          # Fail fast on syntax errors or undefined names
+          flake8 src/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Style/complexity checks (ignore lambda_pkg vendored code)
+          flake8 src/ tests/ --exclude="**/lambda_pkg/**" --count --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Run unit tests
+        run: pytest tests/unit/
+
+      - name: Build SAM application (check only)
+        run: sam build --use-container
+
+  build-and-deploy-dev:
+    name: "Build & Deploy to Dev + Integration Tests"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    environment: dev
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::337909745089:role/GitHubActions-replies-engine-dev
+          aws-region: eu-north-1
+
+      - name: Build SAM application
+        run: sam build --use-container
+
+      - name: Deploy SAM application to Dev
+        run: |
+          sam deploy \
+            --stack-name replies-engine-dev \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --parameter-overrides EnvironmentName=dev LogLevel=DEBUG \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset
+
+      - name: Install test dependencies
+        run: pip install pytest requests boto3
+
+      - name: Get API Gateway Endpoint
+        id: get_api
+        run: |
+          API_ENDPOINT=$(aws cloudformation describe-stacks \
+            --stack-name replies-engine-dev \
+            --query "Stacks[0].Outputs[?OutputKey=='RepliesWebhookApiUrl'].OutputValue" \
+            --output text)
+          echo "API_ENDPOINT=$API_ENDPOINT" >> $GITHUB_ENV
+
+      - name: Run integration tests
+        run: pytest tests/integration/
+        env:
+          API_ENDPOINT: ${{ env.API_ENDPOINT }}
+          ENVIRONMENT: dev 
