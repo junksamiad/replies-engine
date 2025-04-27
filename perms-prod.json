@@ -14,7 +14,11 @@
     {
       "Effect": "Allow",
       "Action": "lambda:*",
-      "Resource": "arn:aws:lambda:*:337909745089:function:replies-engine-prod-*"
+      "Resource": [
+        "arn:aws:lambda:*:337909745089:function:replies-engine-prod-*",
+        "arn:aws:lambda:*:337909745089:function:ai-multi-comms-replies-*-prod",
+        "arn:aws:lambda:*:337909745089:function:ai-multi-comms-replies-*-*-prod"
+      ]
     },
     {
       "Effect": "Allow",
