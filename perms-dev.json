@@ -1,0 +1,96 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "cloudformation:*",
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:*",
+      "Resource": "arn:aws:s3:::aws-sam-cli-managed-*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "lambda:*",
+      "Resource": [
+        "arn:aws:lambda:*:337909745089:function:replies-engine-dev-*",
+        "arn:aws:lambda:*:337909745089:function:ai-multi-comms-replies-*-dev",
+        "arn:aws:lambda:*:337909745089:function:ai-multi-comms-replies-*-*-dev"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "apigateway:*",
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sqs:*",
+        "sqs:CreateQueue"
+      ],
+      "Resource": [
+        "arn:aws:sqs:*:337909745089:*-replies-*-*-dev*",
+        "arn:aws:sqs:*:337909745089:ai-multi-comms-replies-*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "dynamodb:*",
+      "Resource": [
+        "arn:aws:dynamodb:*:337909745089:table/replies-engine-dev-*",
+        "arn:aws:dynamodb:*:337909745089:table/ai-multi-comms-conversations-*",
+        "arn:aws:dynamodb:*:337909745089:table/ai-multi-comms-replies-conversations-*-*",
+        "arn:aws:dynamodb:*:337909745089:table/ai-multi-comms-replies-conversations-*-*-*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:TagRole",
+        "iam:PassRole",
+        "iam:CreatePolicy",
+        "iam:DeletePolicy",
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion",
+        "iam:ListPolicyVersions",
+        "iam:ListAttachedRolePolicies",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy"
+      ],
+      "Resource": [
+        "arn:aws:iam::337909745089:role/replies-engine-dev-*",
+        "arn:aws:iam::337909745089:role/replies-engine-*-role-dev",
+        "arn:aws:iam::337909745089:policy/replies-engine-dev-*",
+        "arn:aws:iam::337909745089:role/ai-multi-comms-replies-*-role-dev",
+        "arn:aws:iam::337909745089:role/ai-multi-comms-replies-dev-*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
+      "Resource": "arn:aws:secretsmanager:*:337909745089:secret:ai-multi-comms/*-dev*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "logs:*",
+      "Resource": "arn:aws:logs:*:337909745089:log-group:/aws/lambda/replies-engine-dev-*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "lambda:*"
+      ],
+      "Resource": [
+        "arn:aws:lambda:eu-north-1:337909745089:function:replies-engine-dev-*",
+        "arn:aws:lambda:eu-north-1:337909745089:function:ai-multi-comms-replies-*-dev",
+        "arn:aws:lambda:eu-north-1:337909745089:function:ai-multi-comms-replies-dev-*"
+      ]
+    }
+  ]
+} 

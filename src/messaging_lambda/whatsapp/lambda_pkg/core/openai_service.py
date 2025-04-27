@@ -160,24 +160,22 @@ def process_reply_with_ai(
         return AI_SUCCESS, result_payload
 
     # --- Exception Handling --- #
-    except openai.RateLimitError as e:
-        error_msg = f"OpenAI Rate Limit Error processing thread {thread_id}, run {run_id}: {e}"
+    except openai.APIError as e: # Catch base OpenAI API errors
+        error_msg = f"OpenAI API Error processing thread {thread_id}, run {run_id}: ({type(e).__name__}) {e}"
         logger.error(error_msg)
-        return AI_TRANSIENT_ERROR, {"error_message": error_msg}
-    except (openai.APIConnectionError, openai.Timeout, openai.InternalServerError) as e:
-        error_msg = f"OpenAI Transient API Error processing thread {thread_id}, run {run_id}: {e}"
-        logger.error(error_msg)
-        return AI_TRANSIENT_ERROR, {"error_message": error_msg}
-    except (openai.AuthenticationError, openai.PermissionDeniedError, openai.NotFoundError, openai.BadRequestError, openai.UnprocessableEntityError) as e:
-        error_msg = f"OpenAI Non-Transient API Error processing thread {thread_id}, run {run_id}: {e}"
-        logger.error(error_msg)
-        return AI_NON_TRANSIENT_ERROR, {"error_message": error_msg}
-    except openai.APIError as e:
-        # Catch any other OpenAI specific errors - treat as non-transient by default
-        error_msg = f"Unhandled OpenAI API Error processing thread {thread_id}, run {run_id}: {e}"
-        logger.error(error_msg)
-        return AI_NON_TRANSIENT_ERROR, {"error_message": error_msg}
+        # Check for specific transient error types
+        if isinstance(e, (
+            openai.RateLimitError,
+            openai.APIConnectionError,
+            openai.Timeout,
+            openai.InternalServerError
+        )):
+            return AI_TRANSIENT_ERROR, {"error_message": error_msg}
+        else:
+            # Treat all other API errors (Auth, Permission, NotFound, BadRequest, etc.) as non-transient
+            return AI_NON_TRANSIENT_ERROR, {"error_message": error_msg}
     except Exception as e:
         error_msg = f"Unexpected error during OpenAI processing for thread {thread_id}, run {run_id}: {e}"
         logger.exception(error_msg)
+        # Treat unexpected errors as non-transient for safety
         return AI_NON_TRANSIENT_ERROR, {"error_message": error_msg} 
