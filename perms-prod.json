@@ -39,7 +39,12 @@
     {
       "Effect": "Allow",
       "Action": "dynamodb:*",
-      "Resource": "arn:aws:dynamodb:*:337909745089:table/replies-engine-prod-*"
+      "Resource": [
+        "arn:aws:dynamodb:*:337909745089:table/replies-engine-prod-*",
+        "arn:aws:dynamodb:*:337909745089:table/ai-multi-comms-conversations-*",
+        "arn:aws:dynamodb:*:337909745089:table/ai-multi-comms-replies-conversations-*-*",
+        "arn:aws:dynamodb:*:337909745089:table/ai-multi-comms-replies-conversations-*-*-*"
+      ]
     },
     {
       "Effect": "Allow",
