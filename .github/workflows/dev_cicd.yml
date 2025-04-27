@@ -88,7 +88,7 @@ jobs:
       - name: Deploy SAM application to Dev
         run: |
           sam deploy \
-            --stack-name replies-engine-dev \
+            --stack-name ai-multi-comms-replies-dev \
             --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
             --parameter-overrides EnvironmentName=dev LogLevel=DEBUG \
             --resolve-s3 \
