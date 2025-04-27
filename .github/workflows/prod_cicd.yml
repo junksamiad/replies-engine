@@ -87,7 +87,7 @@ jobs:
       - name: Deploy SAM application to Prod
         run: |
           sam deploy \
-            --stack-name replies-engine-prod \
+            --stack-name ai-multi-comms-replies-prod \
             --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
             --parameter-overrides EnvironmentName=prod LogLevel=INFO \
             --resolve-s3 \
