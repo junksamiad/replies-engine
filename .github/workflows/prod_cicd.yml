@@ -1,0 +1,78 @@
+name: Prod CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  pr_checks:
+    name: "PR Checks (Lint, Unit Tests, Build)"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt flake8
+
+      - name: Lint with flake8
+        run: |
+          flake8 src/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 src/ tests/ --exclude="**/lambda_pkg/**" --count --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Run unit tests
+        run: pytest tests/unit/
+
+      - name: Build SAM application (check only)
+        run: sam build --use-container
+
+  build-and-deploy-prod:
+    name: "Build & Deploy to Prod"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: prod
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::337909745089:role/GitHubActions-replies-engine-prod
+          aws-region: eu-north-1
+
+      - name: Build SAM application
+        run: sam build --use-container
+
+      - name: Deploy SAM application to Prod
+        run: |
+          sam deploy \
+            --stack-name replies-engine-prod \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --parameter-overrides EnvironmentName=prod LogLevel=INFO \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset 
