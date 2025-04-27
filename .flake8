@@ -1,16 +1,27 @@
 [flake8]
-# Exclude third-party vendored libraries packaged with the Lambda code so that
-# linting focuses on *our* application logic only.
+# Line length - follows template-sender-engine convention
+max-line-length = 100
+max-complexity = 10
+
+# Exclude third-party/vendored libs and standard ignores
 exclude =
+    .git,
     .venv,
     .aws-sam,
     __pycache__,
     build,
     dist,
+    **/lambda_pkg/**,
     src/messaging_lambda/whatsapp/*,
-    src/staging_lambda/*
-# Project style rules (mirrors template-sender-engine)
-max-line-length = 127
-max-complexity = 10
-# Allow some stylistic warnings that are not critical
-ignore = E203,W503 
+    src/staging_lambda/*,
+    replies_engine_docs/scripts/
+
+# Match template-sender-engine's ignored rules
+ignore = E203, W503
+
+# Per-file ignores - special handling for common patterns
+per-file-ignores =
+    # Allow unused imports in __init__.py files
+    */__init__.py:F401
+    # Allow unused imports and redefinitions in test files
+    tests/*:F401,F811,E501 

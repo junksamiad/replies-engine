@@ -8,6 +8,7 @@ import boto3
 import pytest
 import requests
 from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
 
 # Remove top-level constants, read from os.environ within tests/fixtures
 # from .conftest import (

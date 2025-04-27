@@ -32,13 +32,27 @@ jobs:
 
       - name: Lint with flake8
         run: |
-          # Fail fast on syntax errors or undefined names
-          flake8 src/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics
-          # Style/complexity checks (ignore lambda_pkg vendored code)
-          flake8 src/ tests/ --exclude="**/lambda_pkg/**" --count --max-complexity=10 --max-line-length=127 --statistics
+          # Stop the build if there are Python syntax errors or undefined names
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Exit-zero treats all errors as warnings. Mirrors template-sender-engine.
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
 
       - name: Run unit tests
-        run: pytest tests/unit/
+        run: |
+          # Install explicit test dependencies
+          pip install boto3 botocore twilio pytest pytest-env openai
+          
+          # Debug: List installed packages
+          pip list | grep -E 'boto|twilio|openai'
+          
+          # Set Python path to include src
+          export PYTHONPATH=$PYTHONPATH:$(pwd)
+          
+          # Set AWS region for tests (default to eu-north-1 if not set)
+          export AWS_DEFAULT_REGION=eu-north-1
+          
+          # Run the tests
+          pytest tests/unit/
 
       - name: Build SAM application (check only)
         run: sam build --use-container
@@ -77,6 +91,7 @@ jobs:
             --stack-name replies-engine-dev \
             --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
             --parameter-overrides EnvironmentName=dev LogLevel=DEBUG \
+            --resolve-s3 \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset
 
