@@ -96,7 +96,7 @@ jobs:
             --no-fail-on-empty-changeset
 
       - name: Install test dependencies
-        run: pip install pytest requests boto3
+        run: pip install pytest requests boto3 twilio
 
       - name: Get API Gateway Endpoint
         id: get_api
