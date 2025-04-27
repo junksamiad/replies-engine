@@ -1,0 +1,21 @@
+# Core AWS dependencies
+boto3==1.37.38
+botocore==1.37.38
+s3transfer==0.11.5
+
+# Twilio dependencies
+twilio==9.5.2
+
+# HTTP-related dependencies
+requests==2.32.3
+aiohttp==3.11.18
+aiohttp_retry==2.9.1
+
+# Testing dependencies
+pytest==8.3.5
+pytest-env==1.1.5
+
+# Utilities
+PyJWT==2.10.1
+PyYAML==6.0.2
+python-dateutil==2.9.0.post0 
