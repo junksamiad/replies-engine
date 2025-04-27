@@ -1,1 +1,1 @@
-"""Message lambda package.""" 
+"""Message lambda package."""
