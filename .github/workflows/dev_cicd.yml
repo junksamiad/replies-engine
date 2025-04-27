@@ -33,9 +33,9 @@ jobs:
       - name: Lint with flake8
         run: |
           # Fail fast on syntax errors or undefined names
-          flake8 src/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics --exclude="src/messaging_lambda/**,src/staging_lambda/**,**/lambda_pkg/**"
-          # Style/complexity checks (ignore lambda_pkg vendored code)
-          flake8 src/ tests/ --exclude="src/messaging_lambda/**,src/staging_lambda/**,**/lambda_pkg/**" --count --max-complexity=10 --max-line-length=127 --statistics
+          flake8 src/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Style/complexity checks (rely on .flake8 for excludes)
+          flake8 src/ tests/ --count --max-complexity=10 --max-line-length=127 --statistics
 
       - name: Run unit tests
         run: pytest tests/unit/
