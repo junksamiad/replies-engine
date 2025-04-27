@@ -23,8 +23,14 @@
     },
     {
       "Effect": "Allow",
-      "Action": "sqs:*",
-      "Resource": "arn:aws:sqs:*:337909745089:replies-engine-*-queue-prod"
+      "Action": [
+        "sqs:*",
+        "sqs:CreateQueue"
+      ],
+      "Resource": [
+        "arn:aws:sqs:*:337909745089:*-replies-*-*-prod*",
+        "arn:aws:sqs:*:337909745089:ai-multi-comms-replies-*-prod*"
+      ]
     },
     {
       "Effect": "Allow",
@@ -51,7 +57,9 @@
       "Resource": [
         "arn:aws:iam::337909745089:role/replies-engine-prod-*",
         "arn:aws:iam::337909745089:role/replies-engine-*-role-prod",
-        "arn:aws:iam::337909745089:policy/replies-engine-prod-*"
+        "arn:aws:iam::337909745089:policy/replies-engine-prod-*",
+        "arn:aws:iam::337909745089:role/ai-multi-comms-replies-*-role-prod",
+        "arn:aws:iam::337909745089:role/ai-multi-comms-replies-prod-*"
       ]
     },
     {
