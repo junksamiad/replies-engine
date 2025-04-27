@@ -102,7 +102,7 @@ jobs:
         id: get_api
         run: |
           API_ENDPOINT=$(aws cloudformation describe-stacks \
-            --stack-name replies-engine-dev \
+            --stack-name ai-multi-comms-replies-dev \
             --query "Stacks[0].Outputs[?OutputKey=='RepliesWebhookApiUrl'].OutputValue" \
             --output text)
           echo "API_ENDPOINT=$API_ENDPOINT" >> $GITHUB_ENV
