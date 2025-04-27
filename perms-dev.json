@@ -14,7 +14,11 @@
     {
       "Effect": "Allow",
       "Action": "lambda:*",
-      "Resource": "arn:aws:lambda:*:337909745089:function:replies-engine-dev-*"
+      "Resource": [
+        "arn:aws:lambda:*:337909745089:function:replies-engine-dev-*",
+        "arn:aws:lambda:*:337909745089:function:ai-multi-comms-replies-*-dev",
+        "arn:aws:lambda:*:337909745089:function:ai-multi-comms-replies-*-*-dev"
+      ]
     },
     {
       "Effect": "Allow",
@@ -71,6 +75,17 @@
       "Effect": "Allow",
       "Action": "logs:*",
       "Resource": "arn:aws:logs:*:337909745089:log-group:/aws/lambda/replies-engine-dev-*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "lambda:*"
+      ],
+      "Resource": [
+        "arn:aws:lambda:eu-north-1:337909745089:function:replies-engine-dev-*",
+        "arn:aws:lambda:eu-north-1:337909745089:function:ai-multi-comms-replies-*-dev",
+        "arn:aws:lambda:eu-north-1:337909745089:function:ai-multi-comms-replies-dev-*"
+      ]
     }
   ]
 } 
