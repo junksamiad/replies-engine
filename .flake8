@@ -13,7 +13,8 @@ exclude =
     dist,
     **/lambda_pkg/**,
     src/messaging_lambda/whatsapp/*,
-    src/staging_lambda/*
+    src/staging_lambda/*,
+    replies_engine_docs/scripts/
 
 # Match template-sender-engine's ignored rules
 ignore = E203, W503
